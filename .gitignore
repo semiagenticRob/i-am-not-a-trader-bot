@@ -1,0 +1,16 @@
+# Secrets never live in this repo — engine credentials belong in
+# ~/.config/i-am-not-a-trader-bot/env (outside the tree; agent containers
+# mount this repo read-only and runtime/ read-write).
+.env
+*.env
+
+# Runtime state (ledger, reports, logs, control files) — machine-local.
+runtime/
+
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.DS_Store

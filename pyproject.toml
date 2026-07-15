@@ -1,0 +1,33 @@
+[project]
+name = "iamnotatrader"
+version = "0.1.0"
+description = "Evidence-gated Polymarket BTC 5m trading system (Rep 30)"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+    "websockets>=12",
+    "pyyaml>=6",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+# Live trading only; shadow mode never needs exchange credentials or a client.
+live = ["py_clob_client_v2"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["engine", "analytics"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
