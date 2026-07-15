@@ -78,3 +78,52 @@ class FeatureSnapshot:
     @classmethod
     def from_json(cls, text: str) -> FeatureSnapshot:
         return cls(**json.loads(text))
+
+
+BUCKET_SEC = 300
+
+
+def compute_snapshot(
+    market,
+    up_book,
+    down_book,
+    spot_open: float | None,
+    spot_last: float | None,
+    spot_ts: float | None,
+    now: float,
+    staleness_sec: float,
+) -> FeatureSnapshot:
+    """Pure assembly of a FeatureSnapshot from already-fetched market state.
+
+    No I/O; independently testable. `market` must expose slug, end_ts,
+    fee_rate, fees_enabled (engine.market_feed.MarketInfo). `up_book` and
+    `down_book` must expose best_bid, best_ask, bid_depth_usd, ask_depth_usd,
+    ts (engine.market_feed.BookTop) or be None when never fetched. Staleness
+    here is purely age-based: a side is stale when its last update is older
+    than staleness_sec (or missing entirely).
+    """
+
+    def aged(ts: float | None) -> bool:
+        return ts is None or (now - ts) > staleness_sec
+
+    quote_stale = up_book is None or down_book is None or aged(up_book.ts) or aged(down_book.ts)
+    spot_stale = spot_last is None or aged(spot_ts)
+    return FeatureSnapshot(
+        bucket_ts=int(now // BUCKET_SEC) * BUCKET_SEC,
+        market_slug=market.slug,
+        seconds_to_close=market.end_ts - now,
+        btc_open=spot_open,
+        btc_last=spot_last,
+        up_best_bid=up_book.best_bid if up_book else None,
+        up_best_ask=up_book.best_ask if up_book else None,
+        down_best_bid=down_book.best_bid if down_book else None,
+        down_best_ask=down_book.best_ask if down_book else None,
+        up_bid_depth_usd=up_book.bid_depth_usd if up_book else 0.0,
+        up_ask_depth_usd=up_book.ask_depth_usd if up_book else 0.0,
+        down_bid_depth_usd=down_book.bid_depth_usd if down_book else 0.0,
+        down_ask_depth_usd=down_book.ask_depth_usd if down_book else 0.0,
+        fee_rate=market.fee_rate,
+        fees_enabled=market.fees_enabled,
+        quote_stale=quote_stale,
+        spot_stale=spot_stale,
+    )
