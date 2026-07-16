@@ -10,6 +10,9 @@
 #   status        running? pid? STOP present? last export stamp + row counts
 #   logs [-f]     tail runtime/logs/engine.log
 #   report        regenerate runtime/reports/ and print latest.md
+#   go-live       run the go-live checklist (integrity, live variant, creds,
+#                 venue gate, typed confirmation) and arm live trading by
+#                 writing runtime/control/go-live; see docs/phase2-runbook.md
 #
 # Deliberately simple and readable: this is an operator tool, not a framework.
 set -euo pipefail
@@ -145,6 +148,82 @@ print(Path("runtime/reports/latest.md").read_text())
 EOF
 }
 
+cmd_go_live() {
+    # Five checks in order, each printed; ANY failure aborts before the arm
+    # step. This is one of the three independent live switches (config
+    # status:live + funding-gate pass + this confirmation) — see
+    # docs/phase2-runbook.md section 3 for the full checklist around it.
+    local creds="$HOME/.config/i-am-not-a-trader-bot/env"
+    local venue_marker="$RUNTIME/venue-verified"
+    local runbook="docs/phase2-runbook.md"
+
+    # (1) integrity: tracked engine/ + config/ must match the last
+    # human-reviewed commit — those paths enforce the hard caps.
+    if [ -n "$(git -C "$ROOT" status --porcelain -- engine config)" ]; then
+        echo "[1/5] integrity: FAIL — engine/ or config/ dirty vs git:"
+        git -C "$ROOT" status --porcelain -- engine config | sed 's/^/        /'
+        echo "      commit or revert (human review) before going live."
+        exit 1
+    fi
+    echo "[1/5] integrity: OK (engine/ and config/ clean vs git)"
+
+    # (2) at least one variant must already be status: live in config —
+    # go-live arms execution, it does not promote anybody.
+    if ! "$PY" - <<'EOF'
+import sys
+from engine.config import load_config
+config = load_config("config/rulesets.yaml")
+sys.exit(0 if config.live_variants else 1)
+EOF
+    then
+        echo "[2/5] live variant: FAIL — no variant has status: live in config/rulesets.yaml."
+        echo "      Promotion flow: funding-gate pass -> pending_promotion -> human edits"
+        echo "      status to live (docs/phase2-runbook.md section 3)."
+        exit 1
+    fi
+    echo "[2/5] live variant: OK (config has at least one status: live variant)"
+
+    # (3) credentials outside the repo tree, mode 0600 exactly.
+    if [ ! -f "$creds" ]; then
+        echo "[3/5] credentials: FAIL — $creds not found (runbook section 2)."
+        exit 1
+    fi
+    local mode
+    mode="$(stat -f '%Lp' "$creds" 2>/dev/null || stat -c '%a' "$creds")"
+    if [ "$mode" != "600" ]; then
+        echo "[3/5] credentials: FAIL — $creds has mode $mode; fix: chmod 600 $creds"
+        exit 1
+    fi
+    echo "[3/5] credentials: OK ($creds, mode 600)"
+
+    # (4) VENUE GATE: the human decision gate in the runbook — which venue
+    # the account is on, CFTC status, 5m-market availability — must have
+    # been executed and recorded. The marker is created manually, on purpose.
+    if [ ! -f "$venue_marker" ]; then
+        echo "[4/5] venue gate: FAIL — $venue_marker missing."
+        echo "      Execute the venue decision gate in $runbook (section 1) and"
+        echo "      record the findings there; it ends with: touch runtime/venue-verified"
+        exit 1
+    fi
+    echo "[4/5] venue gate: OK ($venue_marker present)"
+
+    # (5) typed confirmation, read from the controlling tty so it can't be
+    # piped in by an agent or a script.
+    echo "[5/5] confirmation: type exactly GO LIVE to arm live trading."
+    printf "> "
+    local answer
+    read -r answer < /dev/tty
+    if [ "$answer" != "GO LIVE" ]; then
+        echo "[5/5] confirmation: FAIL — got '$answer', not 'GO LIVE'. Nothing armed."
+        exit 1
+    fi
+
+    mkdir -p "$RUNTIME/control"
+    date -u '+%Y-%m-%dT%H:%M:%SZ' > "$RUNTIME/control/go-live"
+    echo "armed: wrote $RUNTIME/control/go-live ($(cat "$RUNTIME/control/go-live"))"
+    echo "next: flip the engine's live gate and restart (runbook section 3, step 4)."
+}
+
 case "${1:-}" in
     start)        cmd_start ;;
     stop)         cmd_stop ;;
@@ -152,8 +231,9 @@ case "${1:-}" in
     status)       cmd_status ;;
     logs)         shift; cmd_logs "$@" ;;
     report)       cmd_report ;;
+    go-live)      cmd_go_live ;;
     *)
-        sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
         exit 1
         ;;
 esac
