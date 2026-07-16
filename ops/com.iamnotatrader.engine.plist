@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd unit for the shadow engine daemon (load via ops/traderctl start).
+
+  IMPORTANT before any soak run: confirm the host cannot sleep. KeepAlive
+  restarts a crashed engine but does NOT prevent system sleep, which would
+  pause the engine, NanoClaw, and the watchdog simultaneously. Check
+  `pmset -g` (sleep should be 0 / SleepDisabled 1) or run under a
+  `caffeinate -s` wrapper.
+
+  WorkingDirectory is a placeholder for the repo checkout; adjust if the repo
+  lives elsewhere.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.iamnotatrader.engine</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/robertwarren/i-am-not-a-trader-bot/.venv/bin/python</string>
+        <string>-m</string>
+        <string>engine.main</string>
+        <string>--config</string>
+        <string>config/rulesets.yaml</string>
+        <string>--runtime</string>
+        <string>runtime/</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/robertwarren/i-am-not-a-trader-bot</string>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/robertwarren/i-am-not-a-trader-bot/runtime/logs/engine.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/robertwarren/i-am-not-a-trader-bot/runtime/logs/engine.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# traderctl — operator wrapper for the shadow engine daemon.
+#
+# Subcommands:
+#   start         load the launchd unit (falls back to nohup if launchctl or
+#                 the plist is unavailable — e.g. running on a non-mac host)
+#   stop          write runtime/STOP (fail-safe first), then unload/kill
+#   stop-trading  write runtime/STOP only; the running engine parks within
+#                 one tick and resumes when the file is removed
+#   status        running? pid? STOP present? last export stamp + row counts
+#   logs [-f]     tail runtime/logs/engine.log
+#   report        regenerate runtime/reports/ and print latest.md
+#
+# Deliberately simple and readable: this is an operator tool, not a framework.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+RUNTIME="$ROOT/runtime"
+LOGDIR="$RUNTIME/logs"
+LOG="$LOGDIR/engine.log"
+STOP="$RUNTIME/STOP"
+PIDFILE="$RUNTIME/engine.pid"
+PLIST="$ROOT/ops/com.iamnotatrader.engine.plist"
+LABEL="com.iamnotatrader.engine"
+PY="$ROOT/.venv/bin/python"
+# status/report read the EXPORT snapshot, not the live WAL db: the engine is
+# the single writer and WAL state doesn't survive naive copies (see ledger.py).
+EXPORT_DB="$RUNTIME/ledger-export.db"
+STAMP="$RUNTIME/export-stamp.json"
+
+engine_pid() {
+    # engine.main appears verbatim in the daemon's argv
+    pgrep -f "[e]ngine\.main" 2>/dev/null | head -n 1 || true
+}
+
+cmd_start() {
+    mkdir -p "$LOGDIR"
+    if [ -n "$(engine_pid)" ]; then
+        echo "already running (pid $(engine_pid))"
+        return 0
+    fi
+    if command -v launchctl >/dev/null 2>&1 && [ -f "$PLIST" ]; then
+        launchctl load -w "$PLIST"
+        echo "loaded $LABEL via launchd (KeepAlive restarts crashes)"
+    else
+        # Fallback: direct daemonization when launchd isn't available.
+        nohup "$PY" -m engine.main --config config/rulesets.yaml --runtime runtime/ \
+            >>"$LOG" 2>&1 &
+        echo $! > "$PIDFILE"
+        echo "started engine directly (pid $(cat "$PIDFILE")); no auto-restart on crash"
+    fi
+    if [ -f "$STOP" ]; then
+        echo "NOTE: $STOP exists — engine will park until you remove it (rm runtime/STOP)"
+    fi
+}
+
+cmd_stop() {
+    # STOP first: fail-safe even if the unload/kill below fails.
+    touch "$STOP"
+    if command -v launchctl >/dev/null 2>&1 && launchctl list "$LABEL" >/dev/null 2>&1; then
+        launchctl unload "$PLIST"
+        echo "unloaded $LABEL"
+    fi
+    local pid
+    pid="$(engine_pid)"
+    if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null || true
+        echo "killed pid $pid"
+    fi
+    rm -f "$PIDFILE"
+    echo "STOP written; remove runtime/STOP before the next start to resume trading"
+}
+
+cmd_stop_trading() {
+    touch "$STOP"
+    echo "STOP written — engine parks within one tick; rm runtime/STOP to resume"
+}
+
+cmd_status() {
+    local pid
+    pid="$(engine_pid)"
+    if [ -n "$pid" ]; then
+        echo "engine: running (pid $pid)"
+    else
+        echo "engine: not running"
+    fi
+    if [ -f "$STOP" ]; then
+        echo "STOP:   present ($STOP) — trading parked"
+    else
+        echo "STOP:   absent"
+    fi
+    if [ -f "$STAMP" ]; then
+        echo "export stamp: $(stat -f '%Sm' "$STAMP" 2>/dev/null || stat -c '%y' "$STAMP")"
+        echo "stamp contents: $(cat "$STAMP")"
+    else
+        echo "export stamp: none yet (written after each bucket's report)"
+    fi
+    if [ -f "$EXPORT_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+        echo "export db row counts:"
+        sqlite3 "$EXPORT_DB" \
+            "SELECT '  trades:      ' || COUNT(*) FROM trades;
+             SELECT '  evaluations: ' || COUNT(*) FROM evaluations;
+             SELECT '  resolutions: ' || COUNT(*) FROM resolutions;
+             SELECT '  risk_events: ' || COUNT(*) FROM risk_events;"
+    else
+        echo "export db: none yet ($EXPORT_DB)"
+    fi
+}
+
+cmd_logs() {
+    if [ ! -f "$LOG" ]; then
+        echo "no log yet at $LOG"
+        return 1
+    fi
+    if [ "${1:-}" = "-f" ]; then
+        exec tail -n 50 -f "$LOG"
+    fi
+    tail -n "${1:-100}" "$LOG"
+}
+
+cmd_report() {
+    # Inline python (report.py has no __main__ guard and stays untouched).
+    # Prefer the export snapshot to honor single-writer on the live db; fall
+    # back to the live db when no export exists yet (engine never started).
+    "$PY" - <<'EOF'
+import time
+from pathlib import Path
+
+from analytics.report import generate_report
+from engine.config import load_config
+from engine.ledger import Ledger
+
+config = load_config("config/rulesets.yaml")
+db = Path("runtime/ledger-export.db")
+if not db.exists():
+    db = Path("runtime/ledger.db")
+ledger = Ledger(db)
+try:
+    generate_report(ledger, config, "runtime/reports", time.time())
+finally:
+    ledger.close()
+print(Path("runtime/reports/latest.md").read_text())
+EOF
+}
+
+case "${1:-}" in
+    start)        cmd_start ;;
+    stop)         cmd_stop ;;
+    stop-trading) cmd_stop_trading ;;
+    status)       cmd_status ;;
+    logs)         shift; cmd_logs "$@" ;;
+    report)       cmd_report ;;
+    *)
+        sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+        exit 1
+        ;;
+esac
