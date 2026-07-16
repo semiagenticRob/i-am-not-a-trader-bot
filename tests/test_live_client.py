@@ -224,6 +224,7 @@ def test_execute_refuses_non_live_or_non_approved(executor):
 
 def test_execute_submission_failure_marks_failed_and_raises(executor, ledger, client):
     client.post_order.side_effect = RuntimeError("exchange said no")
+    client.get_open_orders.return_value = []  # genuinely never landed
     with pytest.raises(OrderSubmissionError):
         executor.execute(approved(), snap())
     trade = only_trade(ledger)
@@ -231,6 +232,24 @@ def test_execute_submission_failure_marks_failed_and_raises(executor, ledger, cl
     # A failed submission leaves nothing to poll or cancel.
     assert executor.poll_fills(NOW) == 0
     assert executor.cancel_stale(CLOSE) == 0
+
+
+def test_execute_ambiguous_submission_recovers_matched_order(executor, ledger, client):
+    # post_order() raised (e.g. a timeout), but the order actually landed on
+    # the exchange -- it must be adopted, not silently lost as 'failed'.
+    client.post_order.side_effect = TimeoutError("response lost")
+    client.get_open_orders.return_value = [
+        {"order_id": "ord-recovered", "token_id": TOKEN_UP, "price": 0.70}
+    ]
+    trade_id = executor.execute(approved(), snap())
+    trade = only_trade(ledger)
+    assert (trade.id, trade.status, trade.order_id) == (trade_id, "open", "ord-recovered")
+    assert risk_event_kinds(ledger) == ["ambiguous_submission_recovered"]
+    # It's tracked again: a later fill lands in the ledger normally.
+    client.get_order.return_value = {"status": "filled", "filled_price": 0.70, "fee_usd": 0.01}
+    assert executor.poll_fills(NOW + 5) == 1
+    client.get_order.assert_called_once_with("ord-recovered")
+    assert only_trade(ledger).status == "filled"
 
 
 # ---------------------------------------------------------------------------
@@ -275,8 +294,11 @@ def test_poll_fills_formula_fee_when_exchange_reports_none(executor, ledger, cli
 
 def test_cancel_stale_inside_exit_window(executor, ledger, client):
     executor.execute(approved(), snap())
+    client.get_order.return_value = {"status": "cancelled", "filled_price": None, "fee_usd": None}
     assert executor.cancel_stale(float(CLOSE - EXIT_BEFORE_SEC)) == 1
     client.cancel_order.assert_called_once_with("ord-1")
+    # cancel_order alone doesn't confirm fate -- the exchange is re-queried.
+    client.get_order.assert_called_once_with("ord-1")
     trade = only_trade(ledger)
     # The non-fill outcome is Phase 2 fill-rate data: intended price, zero fee.
     assert (trade.status, trade.filled_price, trade.fee_usd) == ("cancelled", 0.70, 0.0)
@@ -287,6 +309,27 @@ def test_cancel_stale_leaves_orders_outside_window(executor, ledger, client):
     assert executor.cancel_stale(float(CLOSE - EXIT_BEFORE_SEC - 60)) == 0
     client.cancel_order.assert_not_called()
     assert only_trade(ledger).status == "open"
+
+
+def test_cancel_stale_fill_races_cancel_records_filled_not_cancelled(executor, ledger, client):
+    # cancel_order() can succeed on the exchange side of a race it already
+    # lost: the order filled a moment before the cancel landed. Re-querying
+    # after cancel_order() must catch this instead of blindly writing
+    # 'cancelled' with a zero-cost, wrong outcome.
+    executor.execute(approved(), snap())
+    client.get_order.return_value = {"status": "filled", "filled_price": 0.70, "fee_usd": 0.03}
+    assert executor.cancel_stale(float(CLOSE - EXIT_BEFORE_SEC)) == 1
+    client.cancel_order.assert_called_once_with("ord-1")
+    trade = only_trade(ledger)
+    assert (trade.status, trade.filled_price, trade.fee_usd) == ("filled", 0.70, 0.03)
+
+
+def test_cancel_stale_unconfirmed_after_cancel_stays_open_for_retry(executor, ledger, client):
+    executor.execute(approved(), snap())
+    client.get_order.return_value = {"status": "open", "filled_price": None, "fee_usd": None}
+    assert executor.cancel_stale(float(CLOSE - EXIT_BEFORE_SEC)) == 0
+    assert only_trade(ledger).status == "open"
+    assert risk_event_kinds(ledger) == ["cancel_not_confirmed"]
 
 
 # ---------------------------------------------------------------------------
@@ -330,10 +373,28 @@ def test_reconcile_matched_but_stale_cancelled(executor, ledger, client):
     client.get_open_orders.return_value = [
         {"order_id": "ord-9", "token_id": TOKEN_UP, "price": 0.70}
     ]
+    client.get_order.return_value = {"status": "cancelled", "filled_price": None, "fee_usd": None}
+    executor.reconcile_on_startup(float(CLOSE - EXIT_BEFORE_SEC + 5))
+    client.cancel_order.assert_called_once_with("ord-9")
+    # cancel_order alone doesn't confirm fate -- the exchange is re-queried.
+    client.get_order.assert_called_once_with("ord-9")
+    trade = only_trade(ledger)
+    assert (trade.id, trade.status, trade.filled_price) == (trade_id, "cancelled", 0.70)
+    assert risk_event_kinds(ledger) == ["reconcile_stale_cancelled"]
+
+
+def test_reconcile_matched_but_stale_fill_races_cancel(executor, ledger, client):
+    trade_id = open_ledger_row(ledger)
+    client.get_open_orders.return_value = [
+        {"order_id": "ord-9", "token_id": TOKEN_UP, "price": 0.70}
+    ]
+    client.get_order.return_value = {"status": "filled", "filled_price": 0.70, "fee_usd": 0.02}
     executor.reconcile_on_startup(float(CLOSE - EXIT_BEFORE_SEC + 5))
     client.cancel_order.assert_called_once_with("ord-9")
     trade = only_trade(ledger)
-    assert (trade.id, trade.status, trade.filled_price) == (trade_id, "cancelled", 0.70)
+    assert (trade.id, trade.status, trade.filled_price, trade.fee_usd) == (
+        trade_id, "filled", 0.70, 0.02,
+    )
     assert risk_event_kinds(ledger) == ["reconcile_stale_cancelled"]
 
 
@@ -350,6 +411,56 @@ def test_reconcile_matched_live_order_is_adopted(executor, ledger, client):
     assert executor.poll_fills(NOW + 5) == 1
     client.get_order.assert_called_once_with("ord-9")
     assert only_trade(ledger).filled_price == 0.72
+
+
+def test_reconcile_uses_persisted_order_id_directly(executor, ledger, client):
+    """Same-process crash mid-lifecycle: the ledger row already carries the
+    order_id attached at submission. reconcile_on_startup must query it
+    directly via get_order rather than fuzzy-matching against
+    get_open_orders."""
+    trade_id = open_ledger_row(ledger)
+    ledger.attach_order_id(trade_id, "ord-9")
+    client.get_open_orders.return_value = []  # irrelevant: order_id is known
+    client.get_order.return_value = {"status": "open", "filled_price": None, "fee_usd": None}
+
+    executor.reconcile_on_startup(NOW)  # 140s to close: still live
+
+    client.get_order.assert_called_once_with("ord-9")
+    client.resolve_token_id.assert_called_once_with(SLUG, "up")
+    assert risk_event_kinds(ledger) == ["reconcile_adopted"]
+    assert only_trade(ledger).status == "open"
+
+
+def test_reconcile_filled_order_no_longer_open_is_recorded_not_lost(executor, ledger, client):
+    """The P0 case: a FILLED order also disappears from get_open_orders(),
+    so it looks identical to 'never placed' by fuzzy matching alone. With
+    order_id persisted, get_order() proves it was filled -- it must be
+    recorded as such, never silently lost as 'failed'."""
+    trade_id = open_ledger_row(ledger)
+    ledger.attach_order_id(trade_id, "ord-9")
+    client.get_open_orders.return_value = []  # filled orders vanish from here
+    client.get_order.return_value = {"status": "filled", "filled_price": 0.71, "fee_usd": 0.02}
+
+    executor.reconcile_on_startup(NOW)
+
+    trade = only_trade(ledger)
+    assert (trade.id, trade.status, trade.filled_price, trade.fee_usd) == (
+        trade_id, "filled", 0.71, 0.02,
+    )
+    assert risk_event_kinds(ledger) == ["reconcile_filled"]
+
+
+def test_reconcile_cancelled_order_confirmed_via_order_id(executor, ledger, client):
+    trade_id = open_ledger_row(ledger)
+    ledger.attach_order_id(trade_id, "ord-9")
+    client.get_open_orders.return_value = []
+    client.get_order.return_value = {"status": "cancelled", "filled_price": None, "fee_usd": None}
+
+    executor.reconcile_on_startup(NOW)
+
+    trade = only_trade(ledger)
+    assert (trade.id, trade.status) == (trade_id, "cancelled")
+    assert risk_event_kinds(ledger) == ["reconcile_cancelled"]
 
 
 # ---------------------------------------------------------------------------

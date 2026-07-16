@@ -168,6 +168,17 @@ verification of it):
    Any mismatch → `ops/traderctl stop-trading`, investigate, and check the
    adapter guesses (Section 6) before resuming.
 
+   Known residual gap (12-persona review, P0 #1, fixed but not fully closed):
+   `execute()` attaches `order_id` to the ledger row right after submission
+   and reconciles/cancels via `get_order` confirmation, so a filled order can
+   no longer be silently lost as `failed`/`cancelled` in the common case. The
+   one race this cannot catch is a `post_order` call that raises AND the
+   order fills before the recovery check — it has no `order_id` and
+   `VenueClient` has no trade-history endpoint to query. Watch for a `failed`
+   live trade whose token/price also shows a fill in the Polymarket UI during
+   this step; if seen, treat as a live incident (stop-trading, reconcile
+   manually) before resuming.
+
 ---
 
 ## Section 4 — Fill-model validation (the point of Phase 2)

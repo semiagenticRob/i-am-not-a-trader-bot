@@ -18,6 +18,17 @@ Hard invariants (grep-able):
 - Write-ahead ledger: the 'open' trade row is written BEFORE the order is
   submitted to the exchange. A crash between the two leaves a reconcilable
   open row (handled by ``reconcile_on_startup``), never an untracked order.
+- Positive confirmation before any terminal write: ``execute`` attaches the
+  exchange ``order_id`` to the ledger row via ``Ledger.attach_order_id``
+  right after submission succeeds, so ``reconcile_on_startup`` can query
+  ``get_order(order_id)`` directly instead of fuzzy-matching by token/price
+  (which cannot tell a filled order — already gone from ``get_open_orders``
+  — apart from one that was never placed). ``cancel_stale`` and
+  ``reconcile_on_startup``'s stale-cancel branch re-query after
+  ``cancel_order`` for the same reason: a fill can race the cancel.
+  Residual gap: an ambiguous submission (``post_order`` raised) that ALSO
+  filled before the recovery check has no order_id and no trade-history
+  endpoint to query — this narrows that race, it does not close it.
 - Credentials live OUTSIDE the repo tree (the repo is mounted into agent
   containers) and are never logged: ``LiveCredentials`` masks its repr so
   ``engine.executor.safe_log_line`` can serialize records that mention it.
@@ -222,21 +233,35 @@ class LiveExecutor:
                 order_type=ORDER_TYPE,
             )
         except Exception as exc:
+            # Ambiguous submission: post_order raised, but the exchange may
+            # have accepted the order before the response was lost (timeout,
+            # disconnect). Check open orders before ever declaring 'failed' —
+            # a real resting order slipping through here would ride to
+            # resolution completely untracked. This cannot catch an order
+            # that ALSO filled before this check (already gone from
+            # get_open_orders()) — a residual gap without a trade-history
+            # endpoint on VenueClient; see docs/phase2-runbook.md.
+            match = self._match_open_order(
+                self._client.get_open_orders(), token_id, approved.limit_price, set()
+            )
+            if match is not None:
+                self._ledger.attach_order_id(trade_id, match["order_id"])
+                self._track(trade_id, match["order_id"], token_id, approved, snap)
+                self._ledger.record_risk_event(
+                    self._clock(),
+                    "ambiguous_submission_recovered",
+                    f"trade {trade_id} order {match['order_id']}: post_order raised "
+                    f"({type(exc).__name__}) but the order was found resting on the "
+                    "exchange; adopted instead of marked failed",
+                )
+                return trade_id
             self._ledger.update_trade_fill(trade_id, None, 0.0, "failed")
             raise OrderSubmissionError(
                 f"order submission failed for trade {trade_id} "
                 f"({approved.market_slug} {approved.side})"
             ) from exc
-        self._orders[trade_id] = _OpenOrder(
-            trade_id=trade_id,
-            order_id=order_id,
-            token_id=token_id,
-            bucket_ts=approved.bucket_ts,
-            intended_price=approved.limit_price,
-            stake_usd=approved.stake_usd,
-            fee_rate=snap.fee_rate,
-            fees_enabled=snap.fees_enabled,
-        )
+        self._ledger.attach_order_id(trade_id, order_id)
+        self._track(trade_id, order_id, token_id, approved, snap)
         return trade_id
 
     # -- order lifecycle -------------------------------------------------------
@@ -249,13 +274,10 @@ class LiveExecutor:
             status = self._client.get_order(order.order_id)
             state = status.get("status")
             if state == "filled":
-                price = status.get("filled_price")
-                if price is None:
-                    price = order.intended_price
-                fee = status.get("fee_usd")
-                if fee is None:
-                    fee = self._formula_fee(order, price)
-                self._ledger.update_trade_fill(trade_id, price, fee, "filled")
+                self._record_confirmed_fill(
+                    trade_id, status, order.intended_price, order.stake_usd,
+                    order.fee_rate, order.fees_enabled,
+                )
                 del self._orders[trade_id]
                 filled += 1
             elif state == "cancelled":
@@ -273,26 +295,40 @@ class LiveExecutor:
         for trade_id, order in list(self._orders.items()):
             close_ts = order.bucket_ts + BUCKET_SEC
             if close_ts - now <= self._config.risk.exit_before_sec:
-                self._client.cancel_order(order.order_id)
-                self._ledger.update_trade_fill(trade_id, order.intended_price, 0.0, "cancelled")
-                del self._orders[trade_id]
-                cancelled += 1
+                terminal = self._cancel_and_confirm(
+                    trade_id, order.order_id, order.intended_price,
+                    order.stake_usd, order.fee_rate, order.fees_enabled, now,
+                )
+                if terminal:
+                    del self._orders[trade_id]
+                    cancelled += 1
         return cancelled
 
     # -- crash reconciliation ----------------------------------------------------
 
     def reconcile_on_startup(self, now: float) -> None:
-        """Reconcile ledger open rows against exchange open orders. MUST run
-        before any new live order after a restart: a crash between place and
-        cancel leaves an orphaned GTC order that could fill in the final
-        seconds and ride to resolution untracked.
+        """Reconcile ledger open rows against exchange state. MUST run before
+        any new live order after a restart: a crash between place and cancel
+        leaves an orphaned GTC order that could fill in the final seconds and
+        ride to resolution untracked.
+
+        A ledger row with a persisted ``order_id`` (attached at submission)
+        is reconciled AUTHORITATIVELY via ``get_order`` — this is what closes
+        the silent-loss gap fuzzy matching cannot: a filled order disappears
+        from ``get_open_orders`` exactly like one that was never placed, but
+        ``get_order(order_id)`` still reports it. A row with no persisted
+        ``order_id`` (submission crashed before that write landed) falls back
+        to the old best-effort fuzzy match by token + price, which still
+        cannot distinguish "filled" from "never placed" — a residual gap
+        without a trade-history endpoint on VenueClient.
 
         Every action is ledgered as a risk_event:
-        - ledger row with no exchange order -> 'failed' (the write-ahead row
-          whose submission never happened, or an order that vanished).
+        - ledger row with no matching/queryable exchange order -> 'failed'.
+        - order confirmed filled/cancelled via get_order -> recorded as such.
         - exchange order with no ledger row -> cancel on the exchange (we
           never adopt an order we cannot attribute).
-        - matched pair already past exit-before-sec -> cancel + 'cancelled'.
+        - matched pair already past exit-before-sec -> cancel, then
+          re-confirmed (a fill can race the cancel).
         - matched pair still live -> adopted into in-memory tracking.
         """
         exchange = list(self._client.get_open_orders())
@@ -302,41 +338,62 @@ class LiveExecutor:
         claimed: set[str] = set()
         for trade in ledger_open:
             token_id = self._client.resolve_token_id(trade.market_slug, trade.side)
-            match = next(
-                (
-                    o
-                    for o in exchange
-                    if o["order_id"] not in claimed
-                    and o.get("token_id") == token_id
-                    and abs(float(o.get("price", -1)) - trade.intended_price) < _PRICE_MATCH_EPS
-                ),
-                None,
-            )
-            if match is None:
-                self._ledger.update_trade_fill(trade.id, None, 0.0, "failed")
-                self._ledger.record_risk_event(
-                    now,
-                    "reconcile_orphan_ledger",
-                    f"trade {trade.id} ({trade.market_slug} {trade.side} "
-                    f"@ {trade.intended_price}) has no matching exchange order; marked failed",
-                )
-                continue
-            claimed.add(match["order_id"])
+            order_id = trade.order_id
+            if order_id is not None:
+                status = self._client.get_order(order_id)
+                claimed.add(order_id)
+                state = status.get("status")
+                if state == "filled":
+                    self._record_confirmed_fill(
+                        trade.id, status, trade.intended_price, trade.stake_usd, 0.0, False,
+                    )
+                    self._ledger.record_risk_event(
+                        now,
+                        "reconcile_filled",
+                        f"trade {trade.id} order {order_id} was filled; recorded",
+                    )
+                    continue
+                if state == "cancelled":
+                    self._ledger.update_trade_fill(trade.id, trade.intended_price, 0.0, "cancelled")
+                    self._ledger.record_risk_event(
+                        now,
+                        "reconcile_cancelled",
+                        f"trade {trade.id} order {order_id} was cancelled exchange-side",
+                    )
+                    continue
+                # still 'open' per the exchange -- fall through to stale/adopt.
+            else:
+                # No persisted order_id: best-effort fuzzy match by token +
+                # price (see docstring — this cannot catch a filled order).
+                match = self._match_open_order(exchange, token_id, trade.intended_price, claimed)
+                if match is None:
+                    self._ledger.update_trade_fill(trade.id, None, 0.0, "failed")
+                    self._ledger.record_risk_event(
+                        now,
+                        "reconcile_orphan_ledger",
+                        f"trade {trade.id} ({trade.market_slug} {trade.side} "
+                        f"@ {trade.intended_price}) has no matching exchange order; marked failed",
+                    )
+                    continue
+                order_id = match["order_id"]
+                claimed.add(order_id)
+
             close_ts = trade.bucket_ts + BUCKET_SEC
             if close_ts - now <= self._config.risk.exit_before_sec:
-                self._client.cancel_order(match["order_id"])
-                self._ledger.update_trade_fill(trade.id, trade.intended_price, 0.0, "cancelled")
+                self._cancel_and_confirm(
+                    trade.id, order_id, trade.intended_price, trade.stake_usd, 0.0, False, now,
+                )
                 self._ledger.record_risk_event(
                     now,
                     "reconcile_stale_cancelled",
-                    f"trade {trade.id} order {match['order_id']} past exit-before-sec; cancelled",
+                    f"trade {trade.id} order {order_id} past exit-before-sec; cancel confirmed",
                 )
             else:
                 # Adopted: fee_rate is unknown post-crash, so a later fill
                 # relies on the exchange-reported fee (formula falls back to 0).
                 self._orders[trade.id] = _OpenOrder(
                     trade_id=trade.id,
-                    order_id=match["order_id"],
+                    order_id=order_id,
                     token_id=token_id,
                     bucket_ts=trade.bucket_ts,
                     intended_price=trade.intended_price,
@@ -347,7 +404,7 @@ class LiveExecutor:
                 self._ledger.record_risk_event(
                     now,
                     "reconcile_adopted",
-                    f"trade {trade.id} order {match['order_id']} still live; re-tracked",
+                    f"trade {trade.id} order {order_id} still live; re-tracked",
                 )
         for order in exchange:
             if order["order_id"] not in claimed:
@@ -360,14 +417,97 @@ class LiveExecutor:
 
     # -- internals ----------------------------------------------------------------
 
+    def _track(
+        self, trade_id: int, order_id: str, token_id: str, approved: Approved, snap: FeatureSnapshot
+    ) -> None:
+        self._orders[trade_id] = _OpenOrder(
+            trade_id=trade_id,
+            order_id=order_id,
+            token_id=token_id,
+            bucket_ts=approved.bucket_ts,
+            intended_price=approved.limit_price,
+            stake_usd=approved.stake_usd,
+            fee_rate=snap.fee_rate,
+            fees_enabled=snap.fees_enabled,
+        )
+
     @staticmethod
-    def _formula_fee(order: _OpenOrder, price: float) -> float:
+    def _match_open_order(
+        exchange: list[dict], token_id: str, price: float, claimed: set[str]
+    ) -> dict | None:
+        return next(
+            (
+                o
+                for o in exchange
+                if o["order_id"] not in claimed
+                and o.get("token_id") == token_id
+                and abs(float(o.get("price", -1)) - price) < _PRICE_MATCH_EPS
+            ),
+            None,
+        )
+
+    def _record_confirmed_fill(
+        self,
+        trade_id: int,
+        status: dict,
+        fallback_price: float,
+        stake_usd: float,
+        fee_rate: float,
+        fees_enabled: bool,
+    ) -> None:
+        price = status.get("filled_price")
+        if price is None:
+            price = fallback_price
+        fee = status.get("fee_usd")
+        if fee is None:
+            fee = self._formula_fee(stake_usd, fee_rate, fees_enabled, price)
+        self._ledger.update_trade_fill(trade_id, price, fee, "filled")
+
+    def _cancel_and_confirm(
+        self,
+        trade_id: int,
+        order_id: str,
+        intended_price: float,
+        stake_usd: float,
+        fee_rate: float,
+        fees_enabled: bool,
+        now: float,
+    ) -> bool:
+        """Cancel a resting order, then re-query it before ever writing a
+        terminal status — ``cancel_order`` succeeding does not by itself say
+        whether a fill raced the cancel. Returns True iff a terminal ledger
+        row was written (the caller should then drop in-memory tracking);
+        False means the exchange still reports the order resting
+        (unexpected, but leaves the row untouched — 'open' — for a later
+        retry rather than guessing).
+        """
+        self._client.cancel_order(order_id)
+        status = self._client.get_order(order_id)
+        state = status.get("status")
+        if state == "filled":
+            self._record_confirmed_fill(
+                trade_id, status, intended_price, stake_usd, fee_rate, fees_enabled
+            )
+            return True
+        if state == "cancelled":
+            self._ledger.update_trade_fill(trade_id, intended_price, 0.0, "cancelled")
+            return True
+        self._ledger.record_risk_event(
+            now,
+            "cancel_not_confirmed",
+            f"trade {trade_id} order {order_id} still reports '{state}' after "
+            "cancel_order; left open for retry",
+        )
+        return False
+
+    @staticmethod
+    def _formula_fee(stake_usd: float, fee_rate: float, fees_enabled: bool, price: float) -> float:
         """Polymarket's published taker formula, used only when the exchange
         response carries no fee: shares * fee_rate * p * (1-p)."""
-        if not order.fees_enabled:
+        if not fees_enabled:
             return 0.0
-        shares = order.stake_usd / price
-        return shares * order.fee_rate * price * (1.0 - price)
+        shares = stake_usd / price
+        return shares * fee_rate * price * (1.0 - price)
 
 
 # ---------------------------------------------------------------------------
