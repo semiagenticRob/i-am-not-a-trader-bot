@@ -46,6 +46,7 @@ from pathlib import Path
 from analytics.report import generate_report
 from engine import rulesets
 from engine.config import Config, ConfigError, check_frozen_variants, load_config
+from engine.control import ControlProcessor
 from engine.evolution import EvolutionManager
 from engine.executor import ResolutionPoller, ShadowExecutor, safe_log_line
 from engine.ledger import Ledger
@@ -85,6 +86,7 @@ class EngineLoop:
         runtime_dir: Path | str | None = None,
         log_sink: Callable[[dict], None] = _print_log,
         evolution=None,  # engine.evolution.EvolutionManager | None; None -> skipped
+        control_processor=None,  # engine.control.ControlProcessor | None; None -> skipped
     ):
         self.config = config
         self.ledger = ledger
@@ -97,6 +99,7 @@ class EngineLoop:
         self.runtime_dir = Path(runtime_dir) if runtime_dir is not None else None
         self.log = log_sink
         self.evolution = evolution
+        self.control_processor = control_processor
         self._last_bucket: int | None = None
         self._last_status: str | None = None
         self._last_evolution_ts: float | None = None
@@ -216,6 +219,11 @@ class EngineLoop:
                     {"event": "report_generated", "ts": now,
                      "ledger_rows": report["ledger_rows"]}
                 )
+            if self.control_processor is not None:
+                # Every rollover (cheap directory scans): apply agent-written
+                # control files — approved lessons, promotion prose, allocations.
+                for action in self.control_processor.process(now):
+                    self.log({"event": "control_action", "ts": now, "action": action})
             if self.evolution is not None and (
                 self._last_evolution_ts is None
                 or now - self._last_evolution_ts >= EVOLUTION_HOOK_SEC
@@ -313,6 +321,16 @@ def build_loop(config: Config, runtime_dir: Path, config_path: Path | None = Non
     evolution = (
         EvolutionManager(config_path, ledger, runtime_dir) if config_path is not None else None
     )
+    control_processor = (
+        ControlProcessor(
+            strategy_md_path=config_path.resolve().parent.parent / "STRATEGY.md",
+            config_path=config_path,
+            runtime_dir=runtime_dir,
+            ledger=ledger,
+        )
+        if config_path is not None
+        else None
+    )
     return EngineLoop(
         config=config,
         ledger=ledger,
@@ -322,6 +340,7 @@ def build_loop(config: Config, runtime_dir: Path, config_path: Path | None = Non
         resolution_poller=ResolutionPoller(ledger, gamma),
         runtime_dir=runtime_dir,
         evolution=evolution,
+        control_processor=control_processor,
     )
 
 
