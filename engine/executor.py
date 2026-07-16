@@ -20,6 +20,7 @@ the credential-isolation decision.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from collections.abc import Callable
@@ -70,6 +71,41 @@ def safe_log_line(record: dict) -> str:
         if pattern.search(line):
             raise ValueError(f"refusing to log: record matches secret pattern '{name}'")
     return line
+
+
+class _RedactingLogHandler(logging.Handler):
+    """Wraps a target handler so stdlib ``logging`` calls can't bypass the
+    SECRET_PATTERNS contract that ``safe_log_line`` enforces for structured
+    logs. Without this, a bare ``logger.warning()`` anywhere in the engine
+    (e.g. ``engine.market_feed``) would reach ``logging.lastResort`` and print
+    straight to stderr, un-redacted, whenever no handler is configured."""
+
+    def __init__(self, target: logging.Handler):
+        super().__init__()
+        self._target = target
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = "<unformattable log record>"
+        for name, pattern in SECRET_PATTERNS.items():
+            if pattern.search(message):
+                record.msg = f"[redacted: matched secret pattern '{name}']"
+                record.args = ()
+                break
+        self._target.emit(record)
+
+
+def install_safe_logging(level: int = logging.WARNING) -> None:
+    """Route all stdlib ``logging`` output through the SECRET_PATTERNS
+    redaction contract by attaching one handler to the root logger. Any
+    handler already on root sees the record too, so this must run before any
+    other handler is configured to be an effective process-wide guarantee."""
+    root = logging.getLogger()
+    root.addHandler(_RedactingLogHandler(logging.StreamHandler()))
+    if root.level == logging.NOTSET or root.level > level:
+        root.setLevel(level)
 
 
 class ExecutorProtocol(Protocol):

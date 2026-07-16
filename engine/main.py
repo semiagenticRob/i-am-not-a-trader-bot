@@ -48,7 +48,7 @@ from engine import rulesets
 from engine.config import Config, ConfigError, check_frozen_variants, load_config
 from engine.control import ControlProcessor
 from engine.evolution import EvolutionManager
-from engine.executor import ResolutionPoller, ShadowExecutor, safe_log_line
+from engine.executor import ResolutionPoller, ShadowExecutor, install_safe_logging, safe_log_line
 from engine.ledger import Ledger
 from engine.market_feed import (
     CaptureLog,
@@ -67,7 +67,21 @@ EVOLUTION_HOOK_SEC = 3600.0  # evolution runs at most once per hour, not per buc
 
 
 def _print_log(record: dict) -> None:
-    print(safe_log_line(record), flush=True)
+    try:
+        print(safe_log_line(record), flush=True)
+    except ValueError:
+        # The record itself is secret-shaped (e.g. an exception message that
+        # embedded leaked credential-looking text) -- never let it through raw.
+        print(
+            safe_log_line(
+                {
+                    "event": record.get("event", "unknown"),
+                    "ts": record.get("ts"),
+                    "error": "redacted (record matched a secret pattern)",
+                }
+            ),
+            flush=True,
+        )
 
 
 class EngineLoop:
@@ -354,25 +368,36 @@ def main(argv: list[str] | None = None) -> int:
     config_path = Path(args.config)
     runtime_dir = Path(args.runtime)
     runtime_dir.mkdir(parents=True, exist_ok=True)
+    install_safe_logging()
 
-    config = startup(config_path, runtime_dir)
-    loop = build_loop(config, runtime_dir, config_path)
+    try:
+        config = startup(config_path, runtime_dir)
+        loop = build_loop(config, runtime_dir, config_path)
 
-    if config.strategy_md_drift:
-        now = loop.clock()
-        detail = (
-            f"config strategy_md_version {config.strategy_md_version} does not match "
-            "the hash of STRATEGY.md's rules section"
+        if config.strategy_md_drift:
+            now = loop.clock()
+            detail = (
+                f"config strategy_md_version {config.strategy_md_version} does not match "
+                "the hash of STRATEGY.md's rules section"
+            )
+            loop.ledger.record_risk_event(now, "strategy_md_drift", detail)
+            loop.log({"event": "strategy_md_drift", "ts": now, "detail": detail})
+
+        if args.once:
+            status = loop.run_once(loop.clock())
+            loop.log({"event": "tick", "ts": loop.clock(), "status": status})
+            return 0
+        loop.run_forever()
+        return 0  # pragma: no cover — run_forever never returns
+    except Exception as exc:  # noqa: BLE001 — last-resort guard: never let a raw
+        # traceback (which could carry leaked secret text from a lower layer)
+        # reach launchd's captured stderr. Only the exception's type name is
+        # logged, never str(exc) — that's exactly what a lower layer may have
+        # refused to log itself.
+        _print_log(
+            {"event": "fatal_exception", "ts": time.time(), "error_type": type(exc).__name__}
         )
-        loop.ledger.record_risk_event(now, "strategy_md_drift", detail)
-        loop.log({"event": "strategy_md_drift", "ts": now, "detail": detail})
-
-    if args.once:
-        status = loop.run_once(loop.clock())
-        loop.log({"event": "tick", "ts": loop.clock(), "status": status})
-        return 0
-    loop.run_forever()
-    return 0  # pragma: no cover — run_forever never returns
+        return 1
 
 
 if __name__ == "__main__":
