@@ -253,7 +253,6 @@ class RiskManager:
         realized = sum(row.pnl for row in self.ledger.realized_pnl_rows(variant.id, "live"))
         committed = sum(
             trade.stake_usd
-            for trade in self.ledger.open_trades()
-            if trade.variant_id == variant.id and trade.mode == "live"
+            for trade in self.ledger.open_trades(variant_id=variant.id, mode="live")
         )
         return variant.allocation_usd + realized - committed

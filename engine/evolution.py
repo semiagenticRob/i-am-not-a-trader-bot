@@ -38,6 +38,7 @@ import json
 import re
 import sqlite3
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -86,8 +87,8 @@ class Proposal:
 
 
 def bootstrap_diff_ci(
-    a,
-    b,
+    a: Iterable[float],
+    b: Iterable[float],
     ci_level: float = PROPOSAL_CI_LEVEL,
     *,
     seed: int = FIXED_SEED,

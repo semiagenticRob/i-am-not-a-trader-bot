@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from engine.market_feed import BookTop, MarketInfo
 
 
 @dataclass(frozen=True)
@@ -84,9 +88,9 @@ BUCKET_SEC = 300
 
 
 def compute_snapshot(
-    market,
-    up_book,
-    down_book,
+    market: MarketInfo,
+    up_book: BookTop | None,
+    down_book: BookTop | None,
     spot_open: float | None,
     spot_last: float | None,
     spot_ts: float | None,

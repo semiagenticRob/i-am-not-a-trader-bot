@@ -23,11 +23,14 @@ import json
 import re
 import time
 from collections.abc import Callable
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from engine.ledger import Ledger
 from engine.risk import Approved
 from engine.signals import BUCKET_SEC, FeatureSnapshot
+
+if TYPE_CHECKING:
+    from engine.market_feed import GammaClient
 
 # Shadow fill pessimism: assume we pay one tick over the quoted ask. Phase 2
 # calibrates this against observed live fills.
@@ -131,7 +134,7 @@ class ResolutionPoller:
     def __init__(
         self,
         ledger: Ledger,
-        gamma_client,
+        gamma_client: GammaClient,
         timeout_hours: float = DEFAULT_RESOLUTION_TIMEOUT_HOURS,
     ):
         self._ledger = ledger

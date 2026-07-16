@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS variants (
     detail TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trades_variant_mode ON trades (variant_id, mode);
+CREATE INDEX IF NOT EXISTS idx_trades_mode_ts ON trades (mode, ts);
 CREATE INDEX IF NOT EXISTS idx_evaluations_bucket ON evaluations (bucket_ts);
 """
 
@@ -315,18 +316,32 @@ class Ledger:
     def trades_for_variant(self, variant_id: str, mode: str) -> list[Trade]:
         return self._trades("variant_id = ? AND mode = ?", (variant_id, mode))
 
-    def open_trades(self) -> list[Trade]:
-        """Trades not yet terminal, plus filled trades whose market has no real outcome."""
+    def open_trades(self, variant_id: str | None = None, mode: str | None = None) -> list[Trade]:
+        """Trades not yet terminal, plus filled trades whose market has no real outcome.
+
+        Optionally filtered to a single variant and/or mode, pushed into the SQL
+        WHERE clause rather than filtered in Python.
+        """
+        extra_where = ""
+        params: list[str] = []
+        if variant_id is not None:
+            extra_where += " AND t.variant_id = ?"
+            params.append(variant_id)
+        if mode is not None:
+            extra_where += " AND t.mode = ?"
+            params.append(mode)
         rows = self._conn.execute(
             f"""
             SELECT t.* FROM trades t
             LEFT JOIN resolutions r
                 ON r.bucket_ts = t.bucket_ts AND r.market_slug = t.market_slug
-            WHERE t.status = 'open'
+            WHERE (t.status = 'open'
                OR (t.status = 'filled'
-                   AND (r.outcome IS NULL OR r.outcome NOT IN {GATE_OUTCOMES!r}))
+                   AND (r.outcome IS NULL OR r.outcome NOT IN {GATE_OUTCOMES!r})))
+            {extra_where}
             ORDER BY t.id
-            """
+            """,
+            params,
         ).fetchall()
         return [Trade(**dict(row)) for row in rows]
 

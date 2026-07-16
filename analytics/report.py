@@ -38,6 +38,7 @@ import json
 import math
 import sqlite3
 import statistics
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -116,7 +117,11 @@ def wilson_interval(wins: int, n: int, ci_level: float = 0.95) -> tuple[float, f
 
 
 def bootstrap_mean_ci(
-    values, ci_level: float = 0.95, *, seed: int = FIXED_SEED, resamples: int = N_BOOTSTRAP
+    values: Iterable[float],
+    ci_level: float = 0.95,
+    *,
+    seed: int = FIXED_SEED,
+    resamples: int = N_BOOTSTRAP,
 ) -> tuple[float | None, float | None]:
     """Percentile bootstrap CI on the mean. Fresh seeded Generator per call
     so identical inputs always give identical intervals. (None, None) if empty."""

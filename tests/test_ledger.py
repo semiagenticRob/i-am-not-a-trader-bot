@@ -97,6 +97,19 @@ def test_unresolved_trade_excluded_from_pnl_present_in_open_view(ledger):
     assert not ledger.has_entry(BUCKET, "mom-a", "live")
 
 
+def test_open_trades_filters_by_variant_and_mode(ledger):
+    enter_and_fill(ledger, variant_id="mom-a", mode="shadow", bucket=BUCKET)
+    enter_and_fill(ledger, variant_id="mom-a", mode="live", bucket=BUCKET + 300)
+    enter_and_fill(ledger, variant_id="fade-a", mode="live", bucket=BUCKET + 600)
+
+    assert [t.mode for t in ledger.open_trades(variant_id="mom-a")] == ["shadow", "live"]
+    assert [t.variant_id for t in ledger.open_trades(mode="live")] == ["mom-a", "fade-a"]
+    only = ledger.open_trades(variant_id="mom-a", mode="live")
+    assert len(only) == 1
+    assert only[0].variant_id == "mom-a"
+    assert only[0].mode == "live"
+
+
 def test_duplicate_bucket_variant_mode_raises(ledger):
     enter_and_fill(ledger)
     with pytest.raises(sqlite3.IntegrityError):
