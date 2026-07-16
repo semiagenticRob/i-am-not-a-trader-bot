@@ -1,7 +1,7 @@
 ---
 title: "feat: Evidence-gated Polymarket BTC 5m trading system with NanoClaw control plane"
 type: feat
-status: active
+status: completed
 date: 2026-07-15
 origin: docs/superpowers/specs/2026-07-15-trading-system-design.md
 ---
