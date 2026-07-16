@@ -1,0 +1,52 @@
+{
+  "reviewer": "performance",
+  "findings": [
+    {
+      "title": "Bootstrap CI recomputes full resample over the entire historical trade set on every 5-minute bucket rollover, with no bound on the ledger's growth",
+      "severity": "P1",
+      "file": "analytics/report.py",
+      "line": 118,
+      "confidence": 100,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "bootstrap_mean_ci builds a numpy array of shape (10_000, n) via rng.integers(0, n, size=(resamples, n)) and again for arr[idx] — O(resamples * n) time AND memory, where n is the total number of resolved trades a variant has EVER accumulated. compute_variant_stats() (called once per configured/spawned variant, unconditionally) reads the variant's FULL history via realized_pnl_rows with no window, cap, or memoization, and fundable_at_checkpoint() does a second, nearly-as-large bootstrap on the checkpoint-truncated history. Both run synchronously inside engine/main.py's _on_bucket_rollover, which fires every ~5 minutes (BUCKET_SEC) for the lifetime of the process, and the ledger is explicitly designed to be append-only with no pruning ('the ledger grows unboundedly over the system's lifetime'). At n=10,000 resolved trades for one variant, the resample index array alone is 10,000*10,000*8 bytes = 800MB, doubled by the payoff array; at n=50,000 this is tens of GB and minutes of CPU, executed twice per variant, every 5 minutes, forever, on the same thread that must also keep polling the market every 2-5s. This is a genuine, unbounded resource-growth trajectory baked into the architecture, not a hypothetical: the system is designed to run 24/7 and spawn new variants (challengers) over its lifetime, each with independently growing trade histories.",
+      "suggested_fix": "Decouple report generation from the poll loop's synchronous rollover hook (run it in a background thread/process so a slow bootstrap can't stall market polling), and bound the bootstrap's per-call cost — e.g. cap the resampled sample to the most recent K resolved trades (documented as a deliberate methodology change, since the docstring currently pins full-history reproducibility), or replace the (resamples, n) matrix build with a chunked/streaming resample loop that keeps memory O(resamples) instead of O(resamples * n). Also consider memoizing per-variant stats keyed on trade count so unchanged variants skip recomputation on rollovers where nothing new resolved."
+    },
+    {
+      "title": "open_trades() scans the entire trades table with no variant/mode filter, called every live-mode risk check to size remaining allocation",
+      "severity": "P2",
+      "file": "engine/ledger.py",
+      "line": 318,
+      "confidence": 75,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "Ledger.open_trades() (engine/ledger.py:318-331) has no WHERE clause on variant_id or mode — it LEFT JOINs the entire trades table against resolutions and returns every open-or-unresolved trade across ALL variants and modes ever recorded. RiskManager._remaining_allocation() (engine/risk.py:249-259) calls it and then filters the fully-materialized Python list down to one variant/mode with a list comprehension. This runs on every RiskManager.check() call in live mode (i.e. every ~3s poll tick within a live variant's entry window, until an entry is recorded for that bucket — see engine/main.py POLL_SEC=3.0). Because the ledger is intentionally never pruned and the system is designed to run many concurrent shadow variants plus spawned challengers indefinitely, this query's row count (and the JOIN/filter cost) grows with the total lifetime trade count of the whole system, not just the one live variant being sized — a full-table-scan-per-tick pattern that gets more expensive the longer the engine has been running.",
+      "suggested_fix": "Add optional variant_id/mode parameters to open_trades() (or a new open_trades_for(variant_id, mode)) and push the filter into the SQL WHERE clause instead of filtering the fully-fetched Python list in _remaining_allocation. Pair with an index on trades(variant_id, mode, status) to make the filtered query index-only."
+    },
+    {
+      "title": "Daily live-cap checks (live_realized_pnl_on_day / live_trade_count_on_day) full-scan the trades table on the per-tick live entry path",
+      "severity": "P2",
+      "file": "engine/ledger.py",
+      "line": 360,
+      "confidence": 75,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "live_realized_pnl_on_day (ledger.py:360-364) and live_trade_count_on_day (ledger.py:366-373) filter on mode='live' plus a ts range, but the only index on trades is idx_trades_variant_mode (variant_id, mode) — useless for a mode-only/ts-range predicate since variant_id isn't bound. Both are called from RiskManager._check_daily_caps (risk.py:211-225), which runs on every live-mode risk check, i.e. every poll tick (~3s) within a live variant's entry window until that bucket's entry is recorded. Since resolutions/trades keep growing forever across every variant and mode (shadow volume in particular, given multiple perpetually-running shadow challengers), these two queries do a full scan over an ever-larger table on the hot live-trading path — the same growth trajectory the task description calls out for the ledger overall.",
+      "suggested_fix": "Add CREATE INDEX idx_trades_mode_ts ON trades (mode, ts) to the schema so the daily-cap queries can use an index range scan instead of a full table scan."
+    }
+  ],
+  "residual_risks": [
+    "The bootstrap-CI growth problem is not confined to analytics/report.py: engine/evolution.py reuses the same unbounded-resample pattern (bootstrap_diff_ci over a variant's full split history in propose_challengers, and fundable_at_checkpoint/paired_comparison in review_promotions) on an hourly cadence (EVOLUTION_HOOK_SEC). As evolution spawns more challengers over the system's lifetime, the number of variants whose full history gets resampled every hour grows too, compounding the same root cause.",
+    "There is no visible monitoring/alerting on report-generation or rollover-hook duration, so a bootstrap call that has grown slow enough to delay the next poll tick (or exhaust memory) would surface only as missed ticks / OOM in production, not as a measurable, actionable signal ahead of time."
+  ],
+  "testing_gaps": [
+    "No test exercises the ledger/report path at a realistic long-run trade volume (e.g. thousands to tens of thousands of resolved trades for a single variant) to catch the bootstrap's O(resamples * n) memory/time blow-up before it surfaces in production.",
+    "No test asserts that open_trades(), live_realized_pnl_on_day, or live_trade_count_on_day stay bounded (or use an index scan) as the trades table grows with unrelated variants/modes — the current tests likely exercise these against small, single-scenario ledgers only."
+  ]
+}

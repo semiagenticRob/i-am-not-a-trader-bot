@@ -1,0 +1,70 @@
+{
+  "reviewer": "testing",
+  "findings": [
+    {
+      "title": "control.py host-fault 'deferred' branches (unreadable file, ControlError/ConfigError) are never exercised",
+      "severity": "P1",
+      "file": "engine/control.py",
+      "line": 152,
+      "confidence": 75,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "suggested_fix": "Add tests that: (1) drop an approved-lesson/pending-append file that raises OSError on read (e.g. unreadable permissions or a directory named *.md) and assert it lands in rejected/ with reason 'unreadable: ...'; (2) point strategy_md_path at a file missing the '## Lessons Learned' heading (or missing rules markers) so _append_to_strategy raises ControlError/ConfigError, and assert the request file is left in place (not archived), a 'control_error' risk event is recorded, and process_control_files returns a 'deferred ...' action without raising; (3) corrupt config/rulesets.yaml before dropping an allocation-requests/*.json file so load_config raises ConfigError inside _process_allocations, and assert the same defer-not-crash behavior.",
+      "why_it_matters": "engine/control.py's own docstring states the core contract of this module: 'Host-side faults (STRATEGY.md unreadable/markerless, config that fails validation) are NOT the request's fault: the file stays in place for a later cycle and a control_error risk event records the problem.' This processor runs on every bucket rollover (per test_rollover_invokes_control_processor_every_rollover), so an unhandled exception on this path would halt the entire trading loop, not just control-file processing. Three distinct branches implement this guarantee (_process_appends' OSError handler at line 152-155, its ControlError/ConfigError handler at line 160-166, and _process_allocations' ConfigError handler at line 217-222) and none of them is exercised by any test in tests/test_control.py -- only the 'garbage request rejected' path (agent-authored malformed content) is tested, which is a different code path (validation failure, not host fault). A bug in any of these three branches (e.g. the file being archived/deleted despite the fault, or the exception propagating uncaught) would not be caught by the current suite and could either silently drop an operator's or evolution's pending request, or crash the daemon.",
+      "evidence": [
+        "engine/control.py:150-169 (_process_appends: OSError -> reject 'unreadable'; ControlError/ConfigError -> 'deferred', file left in place, control_error risk event)",
+        "engine/control.py:211-222 (_process_allocations: ConfigError from load_config -> 'deferred', control_error risk event)",
+        "tests/test_control.py: grep for 'deferred', 'unreadable', 'control_error', 'ConfigError', 'OSError' returns zero matches across the whole file",
+        "engine/control.py:19-24 module docstring explicitly promises this fail-safe behavior as a design invariant"
+      ]
+    },
+    {
+      "title": "EvolutionManager.propose_and_spawn (the method actually wired into the engine loop) is never invoked by any test",
+      "severity": "P1",
+      "file": "engine/evolution.py",
+      "line": 459,
+      "confidence": 75,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "suggested_fix": "Add a test that seeds a variant already at MAX_CHALLENGERS_PER_PARENT active challengers, plants a real winning split so propose_challengers returns a Proposal, then calls mgr.propose_and_spawn(now) directly (not through a stub) and asserts: (1) it does not raise; (2) no new challenger config entry is written; (3) a risk event of kind 'evolution_spawn_skipped' is recorded with the EvolutionError text. Also add a straightforward happy-path test calling propose_and_spawn directly and asserting the returned spawned-id list matches what spawn_challenger would have produced.",
+      "why_it_matters": "engine/main.py:232 calls self.evolution.propose_and_spawn(now) on every throttled rollover -- this is the actual production entry point, not propose_challengers or spawn_challenger individually. propose_and_spawn's own logic (loop over proposals, try/except EvolutionError -> record_risk_event('evolution_spawn_skipped', ...)) is described in its docstring as load-bearing: 'A cap-violating (or otherwise unspawnable) proposal is dropped and ledgered as a risk event -- its statistical case is not lost, just not acted on this cycle.' tests/test_evolution.py only calls propose_challengers and spawn_challenger in isolation (grep confirms zero direct calls to .propose_and_spawn on the real EvolutionManager; the only match is a stub class used to test main.py's throttling, which never executes evolution.py's real code). test_max_two_active_challengers_per_parent (line 322) tests that spawn_challenger raises EvolutionError directly via pytest.raises -- it never proves that propose_and_spawn correctly catches that exception, ledgers it, and continues rather than propagating and crashing the rollover hook.",
+      "evidence": [
+        "engine/main.py:232 self.evolution.propose_and_spawn(now)",
+        "engine/evolution.py:459-472 propose_and_spawn implementation with try/except EvolutionError -> record_risk_event('evolution_spawn_skipped', ...)",
+        "tests/test_evolution.py: grep '\\.propose_and_spawn\\|\\.propose_challengers\\b' shows only propose_challengers called directly (lines 220, 241, 247, 294); no call to propose_and_spawn on a real EvolutionManager anywhere in the file",
+        "tests/test_evolution.py:463-472 _StubEvolution.propose_and_spawn is a no-op stub used only to test main.py's hourly-throttle wiring, not evolution.py's real branch logic"
+      ]
+    },
+    {
+      "title": "LiveExecutor.poll_fills never tests the exchange-initiated cancellation branch",
+      "severity": "P2",
+      "file": "engine/live_client.py",
+      "line": 261,
+      "confidence": 75,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add a test mirroring test_poll_fills_records_exchange_price_and_fee but with client.get_order.return_value = {'status': 'cancelled', ...}; assert poll_fills returns 0 fills, the ledger row transitions to status='cancelled' with filled_price == order.intended_price and fee_usd == 0.0, and the order is removed from in-memory tracking (a second poll_fills call does not re-query it).",
+      "why_it_matters": "poll_fills has three branches on the exchange-reported order state: 'filled' (tested), 'open'/anything-else (tested via test_poll_fills_open_order_stays_open), and 'cancelled' (line 261-265, untested). This third branch handles orders the exchange cancels out-of-band (not via this engine's own cancel_stale call) -- the module's own comment calls it out as 'a terminal non-fill outcome the Phase 2 comparison needs.' Since Phase 2's shadow-vs-live fill-rate comparison depends on this data being recorded correctly, a bug here (e.g. wrong terminal status, fee miscalculated, or the order not being removed from self._orders causing a stuck poll loop) would silently corrupt that comparison and would not be caught by the current suite.",
+      "evidence": [
+        "engine/live_client.py:261-265 elif state == 'cancelled': ... update_trade_fill(..., 'cancelled'); del self._orders[trade_id]",
+        "tests/test_live_client.py: poll_fills tests cover only 'filled' (test_poll_fills_records_exchange_price_and_fee, test_poll_fills_formula_fee_when_exchange_reports_none) and 'open' (test_poll_fills_open_order_stays_open); no test sets get_order.return_value status to 'cancelled'"
+      ]
+    }
+  ],
+  "residual_risks": [
+    "engine/control.py's host-fault defer-and-retry paths (unreadable append file, ControlError/ConfigError during append or allocation processing) are unverified by tests; if any of the three branches has a bug, the failure mode ranges from silently dropping an operator/evolution request to an unhandled exception crashing the rollover hook that also drives the market feed and risk halts.",
+      "EvolutionManager.propose_and_spawn -- the actual production entry point invoked every rollover by engine/main.py -- has no direct test coverage; its exception-to-risk-event translation for cap violations and other EvolutionError cases is unverified in integration, only in the underlying spawn_challenger unit.",
+    "LiveExecutor.poll_fills' exchange-initiated cancellation branch is untested; a bug there would corrupt Phase 2's shadow-vs-live fill-rate comparison data without failing any existing test, though this is lower-urgency while the live executor remains gated behind the venue decision per docs/phase2-runbook.md."
+  ],
+  "testing_gaps": [
+    "No test drives engine/control.py's process_control_files through a genuine host-side fault (unreadable file, STRATEGY.md missing the Lessons Learned heading, or a corrupted on-disk config) to prove the 'defer, don't crash, don't archive' contract actually holds.",
+    "No test invokes EvolutionManager.propose_and_spawn directly (only its two constituents, propose_challengers and spawn_challenger, are unit-tested separately) so the wired integration path used by engine/main.py's rollover hook is unverified end to end.",
+    "engine/live_client.py's poll_fills has no test for the exchange-side 'cancelled' status branch, leaving one of its three terminal-state paths unverified."
+  ]
+}
