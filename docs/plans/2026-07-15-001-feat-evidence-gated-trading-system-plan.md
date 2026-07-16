@@ -198,7 +198,7 @@ schedules (post-resolution and weekly), never inside the hot loop.
 
 ### Phase A — Engine core (shadow-capable)
 
-- [ ] U1. **Scaffolding, STRATEGY.md, and config schema**
+- [x] U1. **Scaffolding, STRATEGY.md, and config schema**
 
 **Goal:** Repo skeleton, tooling, the plain-English rulebook, and its YAML translation with schema validation.
 
@@ -226,7 +226,7 @@ schedules (post-resolution and weekly), never inside the hot loop.
 
 ---
 
-- [ ] U2. **Ledger (SQLite, append-only)**
+- [x] U2. **Ledger (SQLite, append-only)**
 
 **Goal:** The single source of record for every evaluation, decision, order, fill, and resolution, attributable per variant.
 
@@ -259,7 +259,7 @@ schedules (post-resolution and weekly), never inside the hot loop.
 
 ---
 
-- [ ] U3. **Market data layer**
+- [x] U3. **Market data layer**
 
 **Goal:** Reliable, staleness-aware market state: current/next 5m market discovery, CLOB order book, Binance BTC ticks, per-market fee object.
 
@@ -290,7 +290,7 @@ schedules (post-resolution and weekly), never inside the hot loop.
 
 ---
 
-- [ ] U4. **Signals / FeatureSnapshot**
+- [x] U4. **Signals / FeatureSnapshot**
 
 **Goal:** Deterministic feature computation per tick: seconds-to-close, BTC move in interval, skew, spread, top-of-book depth, staleness flags.
 
@@ -317,7 +317,7 @@ schedules (post-resolution and weekly), never inside the hot loop.
 
 ---
 
-- [ ] U5. **Rule-sets (three pure decision functions + variants)**
+- [x] U5. **Rule-sets (three pure decision functions + variants)**
 
 **Goal:** Momentum-follow, contrarian fade, and skew filter as pure functions of (FeatureSnapshot, variant params) → decision (enter side @ limit price / skip with reason).
 
@@ -348,7 +348,7 @@ schedules (post-resolution and weekly), never inside the hot loop.
 
 ---
 
-- [ ] U6. **Risk containment module**
+- [x] U6. **Risk containment module**
 
 **Goal:** Hard caps and guards that no upstream code path can bypass: per-trade max, daily loss cap, max trades/day, spread/depth/staleness guards, consecutive-API-failure halt, STOP file.
 
@@ -385,7 +385,7 @@ schedules (post-resolution and weekly), never inside the hot loop.
 
 ---
 
-- [ ] U7. **Shadow engine loop + daemon packaging**
+- [x] U7. **Shadow engine loop + daemon packaging**
 
 **Goal:** The long-running poll loop tying U2–U6 together in shadow mode, plus launchd packaging and the `traderctl` ops wrapper.
 
@@ -414,7 +414,7 @@ schedules (post-resolution and weekly), never inside the hot loop.
 
 ### Phase B — Evidence and learning
 
-- [ ] U8. **Analytics, diagnostics, funding gate**
+- [x] U8. **Analytics, diagnostics, funding gate**
 
 **Goal:** Per-variant statistics with confidence intervals, the five gambling-vs-trading diagnostics, the funding/kill gate checks, and machine+human readable reports.
 
@@ -446,7 +446,7 @@ schedules (post-resolution and weekly), never inside the hot loop.
 
 ---
 
-- [ ] U9. **Champion/challenger evolution**
+- [x] U9. **Champion/challenger evolution**
 
 **Goal:** Weekly (per ~100 trades) proposal of single-parameter challenger variants backed by a statistical case; shadow spawning; gate-checked promotion with veto window; champion retirement.
 
@@ -479,7 +479,7 @@ schedules (post-resolution and weekly), never inside the hot loop.
 
 ### Phase C — Control plane
 
-- [ ] U10. **NanoClaw integration (operator group, trader skill, nightly verifier)**
+- [x] U10. **NanoClaw integration (operator group, trader skill, nightly verifier)**
 
 **Goal:** Telegram-operated control plane: operator agent group with the repo mounted, `trader` skill, nightly verifier scheduled task with cheap pre-check, distinct sender identities.
 
@@ -514,7 +514,7 @@ schedules (post-resolution and weekly), never inside the hot loop.
 
 ### Phase D — Live trading (venue-gated)
 
-- [ ] U11. **Venue verification + live executor**
+- [x] U11. **Venue verification + live executor**
 
 **Goal:** Determine the legally/practically tradable venue for the user's account; if main-CLOB access is available, implement the live execution path with `py-clob-client-v2`; wire Phase 2 validation.
 
