@@ -411,6 +411,35 @@ def test_veto_cancels_promotion(env):
     assert "live" not in events
 
 
+def test_veto_window_rejects_backdated_delivery_ack(env):
+    env.mgr.spawn_challenger(ENTRY_TIME_PROPOSAL, now=NOW)
+    seed_fundable_challenger(env.ledger, "momentum-v1-c1")
+    notice_path = flag_pending(env, "momentum-v1-c1")
+    created_ts = json.loads(notice_path.read_text())["created_ts"]
+
+    # A backdated ack (before the notice even existed) would, if trusted,
+    # collapse the 24h veto window to zero in a single review call.
+    ack_notice(notice_path, created_ts - 1.0)
+    env.mgr.review_promotions(NOW + 1.0)
+
+    assert json.loads(notice_path.read_text())["veto_deadline_ts"] is None
+    assert raw_variant(env.config_path, "momentum-v1-c1")["status"] == "pending_promotion"
+
+
+def test_veto_window_rejects_non_numeric_delivery_ack(env):
+    env.mgr.spawn_challenger(ENTRY_TIME_PROPOSAL, now=NOW)
+    seed_fundable_challenger(env.ledger, "momentum-v1-c1")
+    notice_path = flag_pending(env, "momentum-v1-c1")
+
+    notice = json.loads(notice_path.read_text())
+    notice["delivery_ack_ts"] = "definitely-now"
+    notice_path.write_text(json.dumps(notice))
+    env.mgr.review_promotions(NOW + 1.0)
+
+    assert json.loads(notice_path.read_text())["veto_deadline_ts"] is None
+    assert raw_variant(env.config_path, "momentum-v1-c1")["status"] == "pending_promotion"
+
+
 def promote(env, challenger_id: str) -> None:
     notice_path = flag_pending(env, challenger_id)
     ack_notice(notice_path, NOW)

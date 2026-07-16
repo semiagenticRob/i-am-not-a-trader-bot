@@ -35,6 +35,7 @@ Fixed candidate-dimension catalog (one dimension at a time, never combined):
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
 import time
@@ -569,11 +570,24 @@ class EvolutionManager:
             return False
         notice = json.loads(notice_path.read_text())
 
-        if notice.get("delivery_ack_ts") is None:
+        ack_ts = notice.get("delivery_ack_ts")
+        if ack_ts is None:
             # Fail-closed: the veto clock never starts on an undelivered notice.
             return False
         if notice.get("veto_deadline_ts") is None:
-            notice["veto_deadline_ts"] = notice["delivery_ack_ts"] + VETO_WINDOW_SEC
+            created_ts = notice.get("created_ts")
+            ack_valid = (
+                isinstance(ack_ts, (int, float))
+                and not isinstance(ack_ts, bool)
+                and math.isfinite(ack_ts)
+                and (created_ts is None or created_ts <= ack_ts)
+                and ack_ts <= now
+            )
+            if not ack_valid:
+                # Fail-closed: a malformed, backdated, or future-dated ack from
+                # the agent-editable notice file can never start the veto clock.
+                return False
+            notice["veto_deadline_ts"] = ack_ts + VETO_WINDOW_SEC
             notice_path.write_text(json.dumps(notice, indent=2, sort_keys=True) + "\n")
         if now < notice["veto_deadline_ts"]:
             return False
