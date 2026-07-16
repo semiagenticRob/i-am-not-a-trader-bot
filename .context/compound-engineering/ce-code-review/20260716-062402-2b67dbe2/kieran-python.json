@@ -1,0 +1,99 @@
+{
+  "reviewer": "kieran-python",
+  "findings": [
+    {
+      "title": "compute_snapshot's core params are untyped despite matching dataclasses already existing",
+      "severity": "P2",
+      "file": "engine/signals.py",
+      "line": 86,
+      "confidence": 85,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "compute_snapshot is the single pure-assembly entry point for FeatureSnapshot -- the value object that flows through risk, rulesets, and the ledger -- yet its market/up_book/down_book parameters carry no type hints at all. The docstring has to describe the required shape in prose ('market must expose slug, end_ts, ...') instead of the type checker doing it, even though engine.market_feed.MarketInfo and BookTop (frozen dataclasses) already exist and are the only real callers' types. A circular import (market_feed imports signals) is the likely reason this was left duck-typed, but `if TYPE_CHECKING: from engine.market_feed import MarketInfo, BookTop` resolves that with zero runtime cost. As written, a caller passing a wrong-shaped object gets no static signal and only fails at attribute-access time deep in ledger persistence.",
+      "suggested_fix": "Add `from typing import TYPE_CHECKING` and, under `if TYPE_CHECKING:`, import MarketInfo and BookTop from engine.market_feed; annotate compute_snapshot as `market: MarketInfo, up_book: BookTop | None, down_book: BookTop | None`.",
+      "evidence": [
+        {"file": "engine/signals.py", "lines": "86-104", "note": "market, up_book, down_book are unannotated; docstring substitutes prose for a real type"},
+        {"file": "engine/market_feed.py", "lines": "49-73", "note": "MarketInfo and BookTop are already frozen dataclasses that would type these params exactly"}
+      ]
+    },
+    {
+      "title": "EngineLoop's constructor leaves its collaborators untyped, with comments standing in for annotations",
+      "severity": "P2",
+      "file": "engine/main.py",
+      "line": 76,
+      "confidence": 85,
+      "autofix_class": "gated_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "EngineLoop is the composition root for the whole daemon, but `executor`, `evolution`, and `control_processor` are declared with no annotation at all -- for the latter two, an inline comment literally spells out the type ('# engine.evolution.EvolutionManager | None; None -> skipped') instead of writing it as a real annotation the type checker can use. `market_state_factory: Callable[[], object]` also throws away the real return type (MarketState) for `object`, and `_evaluate_variant`'s `variant` parameter is untyped even though `Variant` is imported transitively via `engine.config`. This is exactly the kind of public, high-traffic code path the codebase's own conventions (ExecutorProtocol, RiskManager, Ledger) otherwise type cleanly -- the gap is inconsistent with the rest of the diff, not an isolated style choice.",
+      "suggested_fix": "Annotate `executor: ExecutorProtocol`, `evolution: EvolutionManager | None = None`, `control_processor: ControlProcessor | None = None`, `market_state_factory: Callable[[], MarketState]`, and `variant: Variant` in `_evaluate_variant`; import EvolutionManager/ControlProcessor/MarketState/Variant (guard with TYPE_CHECKING if any cycle appears).",
+      "evidence": [
+        {"file": "engine/main.py", "lines": "76-90", "note": "executor untyped; evolution and control_processor typed only in a trailing comment"},
+        {"file": "engine/main.py", "lines": "132", "note": "_evaluate_variant(self, variant, snap: FeatureSnapshot, now: float) -- variant has no annotation"}
+      ]
+    },
+    {
+      "title": "ResolutionPoller.__init__ leaves gamma_client untyped",
+      "severity": "P3",
+      "file": "engine/executor.py",
+      "line": 131,
+      "confidence": 80,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "why_it_matters": "gamma_client has no type annotation even though the only real implementation (engine.market_feed.GammaClient) is a well-typed class defined in this same diff, and tests construct fakes against its exact interface (resolve_outcome). Every other constructor parameter in this file (ledger: Ledger, timeout_hours: float) is annotated; leaving this one bare is an inconsistency a reader has to resolve by grepping call sites rather than reading the signature.",
+      "suggested_fix": "Annotate as `gamma_client: GammaClient` (import from engine.market_feed), or introduce a small Protocol with just `resolve_outcome` if you want to keep executor.py decoupled from market_feed's concrete class.",
+      "evidence": [
+        {"file": "engine/executor.py", "lines": "131-139", "note": "ledger and timeout_hours are typed; gamma_client is not"}
+      ]
+    },
+    {
+      "title": "ResolutionPoller reaches into Ledger's private _conn instead of a public typed read",
+      "severity": "P2",
+      "file": "engine/executor.py",
+      "line": 147,
+      "confidence": 75,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "ledger.py's module docstring is explicit that the ledger's API surface is deliberately narrow ('the only mutation is update_trade_fill... no general UPDATE/DELETE methods') and that Ledger owns its schema. _unresolved_buckets reaches past that boundary into `self._ledger._conn` (a leading-underscore private attribute) to run an ad hoc join, justified only by a comment acknowledging it as an 'API gap workaround'. That's a real encapsulation break: executor.py now depends on Ledger's internal sqlite3.Row shape and column names directly, so a future ledger schema change can silently break resolution polling without touching ledger.py's own tests. The comment shows the author knew this was a workaround rather than the intended design.",
+      "suggested_fix": "Add a small typed public method to Ledger, e.g. `def unresolved_buckets(self) -> list[tuple[int, str]]`, encapsulating this query, and have ResolutionPoller call that instead of touching `_conn`.",
+      "evidence": [
+        {"file": "engine/executor.py", "lines": "141-157", "note": "comment: 'API gap workaround... Read-only query on the ledger's connection'; reaches into _ledger._conn directly"},
+        {"file": "engine/ledger.py", "lines": "1-21", "note": "module docstring frames the ledger's API surface as intentionally narrow"}
+      ]
+    },
+    {
+      "title": "Bootstrap-CI helpers accept untyped sample arguments in two modules",
+      "severity": "P3",
+      "file": "analytics/report.py",
+      "line": 118,
+      "confidence": 75,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "why_it_matters": "bootstrap_mean_ci's `values` parameter and evolution.py's near-identical bootstrap_diff_ci's `a`/`b` parameters (engine/evolution.py:88) are public, statistically load-bearing functions -- they gate funding and promotion decisions -- yet none of their sample-data parameters carry a type hint. Both immediately do `np.asarray(list(x), dtype=float)`, so the intended type (`Iterable[float]`) is obvious from the body; leaving it off both call sites means a caller passing the wrong shape (e.g. a dict of features instead of a list of floats) gets no static signal in code that directly decides whether real money gets allocated to a variant.",
+      "suggested_fix": "Annotate `values: Iterable[float]` in bootstrap_mean_ci and `a: Iterable[float], b: Iterable[float]` in bootstrap_diff_ci (collections.abc.Iterable, already used elsewhere in the diff).",
+      "evidence": [
+        {"file": "analytics/report.py", "lines": "118-120", "note": "values has no annotation; ci_level/seed/resamples are all typed"},
+        {"file": "engine/evolution.py", "lines": "88-95", "note": "a and b have no annotation in the sibling bootstrap_diff_ci"}
+      ]
+    }
+  ],
+  "residual_risks": [
+    "Ruleset params (engine/rulesets.py) and Variant.params (engine/config.py) are plain `dict` rather than a typed shape (TypedDict or per-ruleset dataclass); each ruleset function does string-keyed lookups (params[\"entry_window_sec_min\"], etc.) with no static guarantee the keys exist or are the right type. This is pervasive by design (params legitimately differ per ruleset) so it wasn't flagged as a standalone finding, but it means a config typo in a param key silently produces a KeyError only at evaluation time rather than at config-load time.",
+    "`config` parameters are passed without a `Config` type annotation in several private helper methods across engine/evolution.py (_maybe_flag_pending, _advance_pending, _maybe_retire_champion) and engine/control.py (_validate_allocation_request). Individually below the reporting bar since these are private/internal helpers, but the repeated pattern across two modules suggests a copy-paste habit worth a lint-level type-hint rule (ruff ANN) rather than manual review.",
+    "engine/live_client.py's `_ClobV2Adapter` methods are explicitly marked 'GUESS (verify in smoke test)' against an unexercised vendor API surface; this is documented and gated behind the Phase 2 runbook, not a code-quality issue, but it is a correctness risk that lives entirely outside what a static review can catch."
+  ],
+  "testing_gaps": [
+    "engine/main.py's EngineLoop composition (build_loop) wires EvolutionManager and ControlProcessor as untyped optional collaborators; there's no test asserting build_loop's wiring stays consistent if either constructor's signature changes, since nothing statically ties main.py's call sites to the real classes' __init__ signatures.",
+    "engine/executor.py's ResolutionPoller._unresolved_buckets bypasses Ledger's public API by querying `_conn` directly; a ledger schema migration test that only exercises Ledger's public methods would not catch a column rename breaking this query.",
+    "No test appears to exercise compute_snapshot with a duck-typed object that is missing an attribute the docstring claims is required (e.g. a market object without end_ts) to confirm the failure mode is an honest AttributeError rather than a silently wrong FeatureSnapshot."
+  ]
+}

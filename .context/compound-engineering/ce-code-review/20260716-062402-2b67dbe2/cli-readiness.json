@@ -1,0 +1,94 @@
+{
+  "reviewer": "cli-readiness",
+  "findings": [
+    {
+      "title": "status has no machine-readable output mode; agent-reachable health check is unstructured prose",
+      "severity": "P1",
+      "file": "ops/traderctl",
+      "line": 84,
+      "confidence": 100,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "why_it_matters": "The intent explicitly names status as agent-reachable — it's the primary command an autonomous agent uses to decide whether to intervene (is the engine up, is STOP set, has an export landed, are row counts moving). Every field is emitted as label-prefixed prose ('engine: running (pid 123)', 'STOP:   present (...) — trading parked') with no --json/--format flag anywhere in the script. An agent must regex/string-match this output, and the format is not contractually stable — a wording tweak silently breaks every caller. The sqlite3 block compounds this: it prints pre-formatted strings with embedded label padding ('  trades:      ' || COUNT(*)) inside a semicolon-separated multi-statement query, which is fragile to parse and easy to break further without anyone noticing since nothing consumes it structurally today.",
+      "evidence": [
+        "cmd_status() at ops/traderctl:84-113 builds every line via echo/prose; no branch emits JSON or key=value pairs, and no --json/--format flag is parsed anywhere in the case statement at line 227."
+      ],
+      "suggested_fix": "This is a hand-rolled bash CLI (no Click/argparse/Cobra), so add a lightweight --json flag parsed in cmd_status via getopts or a leading `case \"${1:-}\" in --json)` check, and emit a single jq-buildable JSON object (running, pid, stop_present, export_stamp, row_counts) instead of/alongside the prose. Even a `printf '%s\\n' | jq -Rn ...` fallback beats no structured path."
+    },
+    {
+      "title": "status always exits 0 regardless of engine/STOP state — no exit-code signal for automation",
+      "severity": "P2",
+      "file": "ops/traderctl",
+      "line": 84,
+      "confidence": 100,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "why_it_matters": "cmd_status never calls exit with a non-zero code — not when the engine is down, not when STOP is present, not when the export DB is missing. An agent scripting `traderctl status && do_thing` gets no branch signal at all; it must always parse stdout text to know whether anything is wrong, even for conditions (engine not running, STOP present) that a status-checking agent would reasonably want to detect via exit code the same way it detects command failure elsewhere.",
+      "evidence": [
+        "cmd_status() body (ops/traderctl:84-113) contains no `exit` statement; every branch is `echo` only, so the function always returns the shell's default success status from set -e."
+      ],
+      "suggested_fix": "Define a small convention (e.g., exit 0 = running & no STOP, exit 2 = STOP present/parked, exit 1 = not running) and document it in the header comment block at the top of the script, matching the way `logs` already returns 1 when the log file is missing."
+    },
+    {
+      "title": "logs overloads a single positional argument for both flag (-f) and line-count, producing unactionable errors on any other input",
+      "severity": "P2",
+      "file": "ops/traderctl",
+      "line": 115,
+      "confidence": 75,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "why_it_matters": "cmd_logs treats $1 as either the literal string '-f' or a tail line count, with no getopts-style flag parsing and no validation. An agent that reasonably tries `traderctl logs --lines 200`, `traderctl logs -n 200`, or `traderctl logs -f 200` gets tail's raw, non-actionable error text (e.g. 'tail: illegal option') instead of a traderctl-level message telling it the correct invocation. There is also no way to combine follow-mode with a custom starting window, and no filtering (grep/level/since) despite this being the streaming/logging command class where filtering and truncation controls are the highest-priority principle.",
+      "evidence": [
+        "cmd_logs() at ops/traderctl:115-124: `if [ \"${1:-}\" = \"-f\" ]; then exec tail -n 50 -f \"$LOG\"; fi; tail -n \"${1:-100}\" \"$LOG\"` — any argument that is neither '-f' nor a bare integer is passed straight to `tail -n`, whose error message is not rewritten or contextualized by traderctl."
+      ],
+      "suggested_fix": "Parse args with a small `while getopts \"fn:\" opt` loop (or manual case on \"$1\") so `-f` and `-n <count>` are independent, validate the count is numeric before invoking tail, and print a traderctl-authored usage line on bad input instead of letting tail's raw stderr surface."
+    },
+    {
+      "title": "No --help/-h path; invoking help text always exits 1, indistinguishable from a real usage error",
+      "severity": "P3",
+      "file": "ops/traderctl",
+      "line": 227,
+      "confidence": 100,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "why_it_matters": "The case statement's default branch handles both 'no subcommand given' and 'unknown subcommand' identically — it dumps the header comment block and exits 1. There's no explicit `--help`/`-h`/`help` match, so an agent that probes capabilities with `traderctl --help` (a very common discovery pattern) gets exit code 1, the same signal it would get from a genuine invocation error. An agent scripting around exit codes can't tell 'you asked for help, here it is' apart from 'you did something wrong.'",
+      "evidence": [
+        "ops/traderctl:227-239: `case \"${1:-}\" in start) ...; ... *) sed -n '2,16p' \"$0\" | sed 's/^# \\{0,1\\}//'; exit 1 ;; esac` — no case arm matches --help/-h/help, so all three cases (no arg, --help, typo) fall through to the same exit-1 branch."
+      ],
+      "suggested_fix": "Add an explicit `-h|--help|help)` arm that prints the same usage block but exits 0, leaving the unknown-subcommand fallthrough (still exit 1) as the only error path."
+    },
+    {
+      "title": "report has no --json/--format alternative to the generated markdown; agent must scrape prose to extract figures",
+      "severity": "P2",
+      "file": "ops/traderctl",
+      "line": 126,
+      "confidence": 75,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "why_it_matters": "report is named alongside status as an intentionally agent-reachable command, and it prints runtime/reports/latest.md straight to stdout with no alternate structured path. If an autonomous loop wants specific figures (trade counts, resolution stats) out of the report to decide next actions, it has to parse markdown headings/tables rather than read a stable JSON shape, which is brittle to report-template wording changes and burns tokens re-parsing prose on every check-in.",
+      "evidence": [
+        "cmd_report() at ops/traderctl:126-149 ends with `print(Path(\"runtime/reports/latest.md\").read_text())` — the only output path is the markdown file's raw contents; generate_report's underlying data (whatever backs the markdown) is never exposed as JSON via traderctl."
+      ],
+      "suggested_fix": "If analytics/report.py already computes structured figures before rendering markdown, add a `--json` branch in cmd_report that serializes that same data with json.dumps instead of/in addition to printing the markdown; otherwise expose a minimal `traderctl report --summary` that prints key=value lines an agent can grep reliably."
+    }
+  ],
+  "residual_risks": [
+    "No subcommand in the agent-reachable set (status, report, logs) has a stable, versioned output contract — any future wording change to the prose is a silent breaking change for whatever is currently parsing it, with no test to catch it.",
+    "cmd_status's exit-code gap and lack of --json mean any orchestration currently built on top of traderctl status is necessarily scraping free text today; that scraping logic is invisible to this review and may be more fragile than the script itself suggests."
+  ],
+  "testing_gaps": [
+    "No test asserts the shape/stability of `traderctl status` or `traderctl report` output for programmatic consumption (no golden-output or --json contract test).",
+    "No test exercises `traderctl logs` with non-numeric or malformed arguments to confirm the resulting error is actionable.",
+    "No test asserts exit codes for status across the running/not-running and STOP-present/absent matrix."
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "reviewer": "correctness",
+  "findings": [
+    {
+      "title": "Shadow fill clamp inverts the pessimism model for near-certain favorites, biasing the funding gate",
+      "severity": "P1",
+      "file": "engine/executor.py",
+      "line": 97,
+      "confidence": 75,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "suggested_fix": "MAX_FILL_PRICE (0.99) is lower than achievable limit_price values (rulesets.py allows best_ask up to just under 1.0, e.g. momentum_follow's `favorite_min_price <= ask < 1.0`, and config sets favorite_min_price=0.70). When limit_price > 0.99 (e.g. 0.995), `min(limit_price + TICK, MAX_FILL_PRICE)` clamps filled_price to 0.99, which is BELOW limit_price, inverting the documented 'pessimistic ask+1tick' fill model into an optimistic one for that price band. Since shares = stake/filled_price, a lower filled_price than the real ask overstates share count and payout, inflating modeled shadow pnl for high-price favorite entries — pnl that directly feeds the funding-gate CI (analytics.report.fundable_at_checkpoint) that decides whether real capital gets allocated. Fix by ensuring the modeled fill is never better than the limit price actually paid, e.g. `filled_price = min(max(approved.limit_price, approved.limit_price + TICK), 0.999)` or reject/re-derive TICK sizing so the clamp ceiling is always >= any admissible limit_price.",
+      "why_it_matters": "The funding gate (95% CI lower bound > 0 at pre-registered checkpoints) is the sole mechanism deciding whether a rule-set variant gets real money. If the shadow fill model systematically overstates profitability for one class of entries (favorites priced above 0.99, which momentum_follow explicitly permits), a variant that would not actually clear the bar on real fills could pass the gate and get funded with live capital, defeating the evidence-gating design intent stated in the module and repo-level docstrings.",
+      "evidence": [
+        "engine/executor.py:34-36 defines TICK=0.01 and MAX_FILL_PRICE=0.99; line 97 computes `filled_price = min(approved.limit_price + TICK, MAX_FILL_PRICE)` with no lower bound tied to limit_price.",
+        "engine/rulesets.py:91-92,96-99,102-106 (momentum_follow) allows `favorite_min_price <= best_ask < 1.0`, i.e. asks up to just under 1.0 are valid entries.",
+        "config/rulesets.yaml sets favorite_min_price: 0.70 for the momentum_follow variant, so nothing in config restricts entries to ask <= 0.99.",
+        "tests/test_executor.py:126-128 only tests the clamp at limit_price=0.985 (still >= limit_price after clamp); no test exercises limit_price > 0.99 where filled_price < limit_price results.",
+        "engine/ledger.py:152-156 `_pnl` computes `shares = stake_usd / filled_price`, so a filled_price below the true ask directly inflates modeled share count and win payout."
+      ]
+    },
+    {
+      "title": "consecutive_unresolved() is documented to feed engine-halt logic but is never called by RiskManager or the main loop",
+      "severity": "P1",
+      "file": "engine/risk.py",
+      "line": 127,
+      "confidence": 75,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "suggested_fix": "Either wire a consecutive-unresolved-timeout check into RiskManager.halted() (mirroring the existing consecutive_failure_halt pattern, with its own configured threshold) or remove/correct the executor.py docstring claim that this streak 'feeds engine-halt logic' so operators don't believe a safety net exists that isn't actually active.",
+      "why_it_matters": "Repeated resolution timeouts (Gamma oracle delay, API breakage, or a broken slug/market mapping) are exactly the kind of silent-degradation signal a risk-containment module should escalate on, per the module's own stated design. As written, the engine will keep entering new trades indefinitely even while every recent bucket fails to resolve, with no automatic halt — only a per-event risk_event log entry that nothing reads programmatically.",
+      "evidence": [
+        "engine/executor.py:122-129 (ResolutionPoller docstring): 'once timeout_hours elapse without an outcome it is recorded as unresolved_timeout plus a risk event (the ledger's consecutive-unresolved streak feeds engine-halt logic).'",
+        "engine/ledger.py:382-392 defines Ledger.consecutive_unresolved(), the only consumer of which is tests/test_ledger.py.",
+        "engine/risk.py:127-133 RiskManager.halted() only checks STOP file presence and self._consecutive_failures — no reference to ledger.consecutive_unresolved() anywhere in engine/risk.py or engine/main.py.",
+        "grep across engine/*.py confirms consecutive_unresolved is defined and tested in isolation but has zero call sites outside tests/test_ledger.py."
+      ]
+    }
+  ],
+  "residual_risks": [
+    "engine/ledger.py open_trades() treats trades whose market resolved 'unresolved_timeout' (or, if ever produced, 'voided') as permanently still-open/committed for risk.py's _remaining_allocation calculation — the docstring frames this as intentional (conservative: never release capital for a position with no confirmed real-money outcome), but it means a single stuck oracle resolution permanently and irrecoverably shrinks a live variant's usable allocation with no reconciliation path back to 'free' capital.",
+    "engine/config.py check_frozen_variants() only iterates new.variants when checking the live-params-frozen invariant; a variant present in the prior snapshot as status='live' that is entirely removed from the new config bypasses the frozen-params check for that restart cycle. Re-adding the same variant id with different params in a later edit (after a new snapshot has been written without it) would not be caught as a frozen-param violation. This requires a deliberate two-step manual config edit across two engine restarts to exploit.",
+    "engine/live_client.py's _ClobV2Adapter is explicitly self-documented as unverified guesswork against the real py_clob_client_v2 API (call/response shapes never exercised against a live venue) — correctness of the live order path is contingent on the Phase 2 smoke test the runbook requires before real money moves; this review cannot independently verify it."
+  ],
+  "testing_gaps": [
+    "No test exercises ShadowExecutor.execute with a limit_price above 0.99 (the range where the MAX_FILL_PRICE clamp can produce filled_price < limit_price), despite momentum_follow permitting asks up to just under 1.0.",
+    "No test drives RiskManager/EngineLoop through a sequence of repeated resolution timeouts to confirm (or refute) that consecutive unresolved buckets ever halt trading.",
+    "No test covers engine.config.check_frozen_variants across a variant's removal-then-re-add sequence across two config snapshots, which is the scenario where the live-params-frozen invariant can be bypassed."
+  ]
+}

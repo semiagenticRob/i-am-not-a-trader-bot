@@ -1,0 +1,30 @@
+{
+  "reviewer": "maintainability",
+  "findings": [
+    {
+      "title": "Restore-on-invalid config-yaml rewrite logic duplicated verbatim in evolution.py and control.py",
+      "severity": "P2",
+      "file": "engine/evolution.py",
+      "line": 293,
+      "confidence": 80,
+      "autofix_class": "gated_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "pre_existing": false,
+      "suggested_fix": "Extract the read-original -> write-yaml -> validate -> restore-on-ConfigError sequence into a single shared helper (e.g. `write_raw_config_safely(path, raw)` in engine/config.py, since both callers already import ConfigError/load_config from there) and have EvolutionManager._write_raw_config and control.py's module-level _write_raw_config both call it.",
+      "why_it_matters": "Both modules implement the exact same 5-line 'read original bytes, write new yaml, validate, restore original on ConfigError' sequence as their own private function, and each docstring explicitly cross-references the other ('mirroring evolution.py's restore-on-invalid pattern' / 'this module can never leave a broken config behind'). The two implementations are byte-for-byte the same logic with no shared test forcing them to stay in sync. If the safety invariant ever needs to change (e.g. an atomic rename instead of write-then-restore, or logging on restore), a future editor who fixes one copy has no signal that the other copy needs the same fix -- exactly the 'duplicated logic that should share a helper' risk called out for this multi-agent build.",
+      "evidence": [
+        "engine/evolution.py:293-302 `_write_raw_config`: reads config_path.read_text() as `original`, writes yaml.safe_dump(raw), calls load_config to validate, restores `original` and re-raises on ConfigError.",
+        "engine/control.py:193-202 `_write_raw_config`: identical read/write/validate/restore-on-ConfigError sequence, same parameter shape (path, raw dict).",
+        "engine/control.py:194 docstring: 'Full-document rewrite with restore-on-invalid (evolution.py's pattern)' -- the implementing agent knew about the duplication and documented the cross-reference instead of extracting a shared helper.",
+        "No test in tests/test_evolution.py or tests/test_control.py exercises `_write_raw_config` directly by name, so nothing would catch the two copies drifting apart."
+      ]
+    }
+  ],
+  "residual_risks": [
+    "engine/live_client.py's LiveExecutor and build_venue_client are fully built and tested (U11) but are not wired into engine/main.py's build_loop or startup(); the live-mode gate still unconditionally SystemExits on any `status: live` variant. This is explicitly documented as an intentional, human-reviewed follow-up step in docs/phase2-runbook.md Section 3 step 4 rather than an oversight, so it is not flagged as a finding, but it is worth the next reviewer's awareness that the wiring code path (constructing LiveExecutor, calling reconcile_on_startup before the first poll tick) has no integration test exercising it end-to-end through engine/main.py -- only through tests/test_live_client.py in isolation."
+  ],
+  "testing_gaps": [
+    "No test asserts that engine/evolution.py's and engine/control.py's config-rewrite-with-restore behavior stay behaviorally identical (e.g. both restoring original bytes on a ConfigError raised mid-write), which is the kind of drift duplicated logic invites over time."
+  ]
+}

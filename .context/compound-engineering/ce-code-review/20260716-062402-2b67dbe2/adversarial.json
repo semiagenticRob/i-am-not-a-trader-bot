@@ -1,0 +1,170 @@
+{
+  "reviewer": "adversarial",
+  "findings": [
+    {
+      "title": "Cascade: an ambiguous post_order exception marks a live trade 'failed' while the order may actually be resting on the exchange, producing exactly the untracked position the write-ahead ledger was designed to prevent",
+      "severity": "P0",
+      "file": "engine/live_client.py",
+      "line": 224,
+      "confidence": 90,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "Invariant 5 claims a crash between the ledger write and the exchange submission produces a detectable orphan, never a silent untracked position. That claim only covers the write-ahead ordering (ledger-then-exchange); it does not cover the far more common real-world failure mode of an AMBIGUOUS submission: post_order() throws (timeout, connection reset, 5xx after the matching engine already accepted the order) after the exchange has actually accepted the order. The except block on line 224 treats every exception identically -- it marks the ledger row 'failed' (a TERMINAL status per TERMINAL_FILL_STATUSES) and re-raises. Once a row is 'failed' it is invisible to every subsequent safety net in this file: ledger.open_trades() only returns status='open' rows (or resolved-outcome-pending 'filled' rows), so the trade is excluded; the in-memory self._orders dict was never populated (the assignment on line 230 is never reached because the exception path returns early), so poll_fills/cancel_stale never look at it; and reconcile_on_startup only runs on a process restart, which may be arbitrarily far in the future for a daemon under KeepAlive. Between the ambiguous exception and the next restart, a real order can rest on the exchange and fill in the final seconds of a 5-minute market, riding to resolution with real capital at risk and zero ledger visibility -- the exact scenario the module docstring says can 'never' happen.",
+      "evidence": [
+        "Trigger: LiveExecutor.execute() calls self._client.post_order(...) (line 217); the underlying HTTP call to clob.polymarket.com times out or the connection resets AFTER the exchange's matching engine has already accepted and rested the GTC order, but before the client library returns.",
+        "Step 1: post_order raises (e.g. requests.exceptions.Timeout); the generic 'except Exception as exc' on line 224 catches it with no distinction between 'exchange definitely rejected' and 'exchange response never arrived'.",
+        "Step 2: self._ledger.update_trade_fill(trade_id, None, 0.0, 'failed') on line 225 transitions the write-ahead 'open' row directly to the TERMINAL 'failed' status. LedgerError makes terminal rows immutable (ledger.py update_trade_fill), so this row can never be corrected in-process.",
+        "Step 3: OrderSubmissionError propagates out of execute(); the code never reaches line 230's self._orders[trade_id] = _OpenOrder(...), so the resting order is not tracked in memory either.",
+        "Step 4: the daemon does not crash (the exception is absorbed by the caller's broad except and logged), so the process keeps running with a real resting order on the exchange that is referenced by NO in-memory structure and NO non-terminal ledger row.",
+        "Step 5: poll_fills/cancel_stale iterate only self._orders, so they never see it; ResolutionPoller/reconcile_on_startup only act on ledger state (which says 'failed', terminal) or a future restart. If the order fills, the resulting position is entirely untracked capital exposure until (if ever) a restart triggers reconcile_on_startup's 'exchange order with no ledger row' branch, which would then cancel a possibly-already-filled order."
+      ],
+      "suggested_fix": "On post_order failure, do not assume rejection: attempt a get_order/get_open_orders reconciliation check before writing a terminal status, or write a distinct non-terminal 'submission_ambiguous' status that keeps the row inside open_trades()/the crash-reconciliation sweep until confirmed either way, and run a reconciliation pass immediately (not only at startup) after any ambiguous submission exception."
+    },
+    {
+      "title": "Race: cancel_stale and reconcile_on_startup's stale-cancel branch write a terminal 'cancelled' row without ever re-checking exchange state, silently mis-recording a real fill as a zero-cost cancellation",
+      "severity": "P0",
+      "file": "engine/live_client.py",
+      "line": 276,
+      "confidence": 75,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "cancel_stale operates specifically inside the exit-before-sec window -- the exact moments when a resting GTC order is most likely to match against incoming liquidity in a fast-moving 5-minute market, i.e. exactly when a cancel-vs-fill race is most probable on any real CLOB. The code calls self._client.cancel_order(order.order_id) and, regardless of its return value or whether it raised, unconditionally writes status='cancelled', fee=0.0 at the intended price on the next line. If the order had already matched moments earlier (a near-universal race condition on live matching engines, not a vendor-specific quirk), the ledger now shows zero exposure for a trade that actually holds a real, unhedged position with real money on the line. Because 'cancelled' is a TERMINAL status, this can never be corrected later. The same unconditional pattern appears in reconcile_on_startup's stale-cancel branch. The mis-recorded trade then silently corrupts every risk computation that depends on ledger truth: RiskManager._remaining_allocation() (over-states available capital for the next sizing decision) and RiskManager._check_daily_caps()'s live_realized_pnl_on_day() (a real loss from this position never counts toward the daily loss cap, so the cap can be silently breached).",
+      "evidence": [
+        "engine/live_client.py:268-280 cancel_stale(): calls self._client.cancel_order(order.order_id) then immediately, unconditionally, calls self._ledger.update_trade_fill(trade_id, order.intended_price, 0.0, 'cancelled') and deletes the order from self._orders -- no get_order() call to confirm the cancel actually beat a fill.",
+        "engine/live_client.py:325-333 reconcile_on_startup(): the 'matched pair already past exit-before-sec' branch does the identical unconditional cancel-then-mark-cancelled sequence.",
+        "Trigger: the exchange's matching engine fills the resting order in the microseconds/milliseconds before the cancel request is processed (a standard CLOB race, not requiring any bug on the vendor side); cancel_order() either returns normally (many CLOBs treat cancel-of-filled-order as a harmless no-op) or the response is not inspected either way, since the code discards its return value entirely.",
+        "Consequence: the ledger permanently records this trade as a $0 cancelled non-event while a real position with real settlement risk exists; RiskManager's live daily-loss-cap and remaining-allocation calculations, which both read only 'filled' rows joined to a resolution, never see this trade, so subsequent sizing/halting decisions operate on an understated risk picture."
+      ],
+      "suggested_fix": "Call get_order(order_id) after cancel_order() (or rely solely on the subsequent poll_fills pass) before writing a terminal status; if the exchange reports the order as filled, route it through the normal fill-recording path instead of 'cancelled'."
+    },
+    {
+      "title": "Contract mismatch: the 'risk.py is the sole constructor of Approved' invariant is enforced only by a literal substring grep ('Approved(') that any import-aliasing or whitespace variation bypasses",
+      "severity": "P1",
+      "file": "tests/test_risk.py",
+      "line": 179,
+      "confidence": 90,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "why_it_matters": "Both engine/risk.py's module docstring and the Approved class docstring assert, as a hard safety property, that risk.py is the ONLY place an Approved (and therefore an executable, risk-cleared trade) can be constructed, 'enforced by a test that greps the rest of the engine' -- and that Approved.__post_init__ is 'the last line of defense against oversized stakes' because it is the only constructor. Reading the actual enforcement mechanism shows it is a plain substring check for the literal text 'Approved(' across engine/*.py. Any of the following trivially produces a real, executable Approved instance from a non-risk.py module while leaving the substring 'Approved(' absent from that file's source: `from engine.risk import Approved as A` followed by `A(...)`; a space before the parenthesis (`Approved (...)`, valid Python); `getattr(risk_module, 'Approved')(...)`; or bypassing the constructor and its stake-bounding __post_init__ entirely via `object.__setattr__` on a frozen dataclass instance created with `Approved.__new__(Approved)`. None of these are hypothetical Python tricks -- they are ordinary code patterns that could land in a future PR (e.g. a refactor that imports Approved under an alias to avoid a name collision) without violating the stated invariant's only enforcement mechanism, and the executor's own defense ('assert isinstance(approved, Approved)') would not catch object.__setattr__-constructed instances since isinstance still returns True.",
+      "evidence": [
+        "engine/risk.py:5-9 and 55-57: docstring claims risk.py is 'the only place one may be constructed (enforced by a test that greps the rest of the engine)' and that __post_init__ is 'the last line of defense against oversized stakes'.",
+        "tests/test_risk.py:171-181 test_no_other_module_constructs_approved(): the entire enforcement is `if path.name != 'risk.py' and 'Approved(' in path.read_text()` over engine/*.py (non-recursive, literal substring match, no AST/import analysis).",
+        "Counter-example 1: a hypothetical engine/foo.py containing `from engine.risk import Approved as A\\n...\\nA(variant_id=..., ...)` contains the substring 'Approved as A' and 'A(' but never the exact substring 'Approved(', so the test passes while a second, unaudited construction path exists.",
+        "Counter-example 2: `object.__setattr__(Approved.__new__(Approved), 'stake_usd', 999999)` from any module fully bypasses __post_init__'s stake bound (the property description explicitly relies on __post_init__ being unavoidable), and still contains 'Approved(' as a substring via `Approved.__new__(Approved)`... but a variant using `getattr(engine.risk, 'App' + 'roved')` avoids even that literal substring while still calling __new__ normally, i.e. multiple independent bypass techniques exist simultaneously."
+      ],
+      "suggested_fix": "Replace the substring grep with either (a) an AST-based check that flags any `Call` node whose callee resolves to engine.risk.Approved regardless of import alias, or (b) a runtime guard: have Approved.__post_init__ inspect the calling frame's module (via inspect.stack()) and raise if it is not engine.risk, which enforces the invariant at import-independent runtime rather than at grep time."
+    },
+    {
+      "title": "Assumption violation: veto-notice delivery_ack_ts is trusted from an agent-editable JSON file with zero bounds/type validation, so a backdated or malformed ack collapses the 24h operator veto window",
+      "severity": "P0",
+      "file": "engine/evolution.py",
+      "line": 575,
+      "confidence": 90,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "why_it_matters": "Invariant 4's entire safety argument is that the 24h veto clock starts only from a genuine delivery acknowledgment, so an operator who never saw the notice can never have a variant silently promoted. In this implementation, 'delivery_ack_ts' is a bare field in a JSON file that skills/trader/SKILL.md explicitly instructs an LLM agent to edit directly ('edit the notice JSON and set delivery_ack_ts to the current time (UTC)') -- this file is NOT routed through engine/control.py's validated request pipeline (which has type checks, a reject/archive flow, and ledgered rejection reasons for every other agent-writable request kind). _advance_pending reads notice.get('delivery_ack_ts') and, if it is anything other than None, uses it verbatim as the base for veto_deadline_ts = delivery_ack_ts + VETO_WINDOW_SEC, with no check that it is a plausible timestamp (numeric, not in the future, not before created_ts, not absurdly in the past). Any value that is not exactly None -- including 0, False, a stale cached value, or a value an agent computed incorrectly -- both (a) permanently 'locks in' whatever veto_deadline_ts falls out of that arithmetic (since the notice file is only computed once via the `if notice.get('veto_deadline_ts') is None` guard) and (b) can put that deadline in the past immediately, causing the very next hourly review_promotions() call to promote the variant to live with a real allocation, without any operator having genuinely acknowledged the notice within a real 24-hour reaction window.",
+      "evidence": [
+        "engine/evolution.py:571-578: `if notice.get('delivery_ack_ts') is None: return False` is the ENTIRE gate; the very next lines compute `notice['veto_deadline_ts'] = notice['delivery_ack_ts'] + VETO_WINDOW_SEC` with no type check (a string would raise, but 0, False, or a stale/incorrect number silently succeeds) and no bound against `notice['created_ts']` or the current `now`.",
+        "skills/trader/SKILL.md:89-99 instructs the agent, on operator instruction to deliver, to directly edit `trader-runtime/control/veto-notices/<variant>.json` and set delivery_ack_ts -- this is a self-reported, unauthenticated field with no host-side plausibility check, unlike control.py's parallel `allocation-requests` pipeline which validates and archives every request.",
+        "Concrete trigger: an agent (mistakenly reusing `created_ts`, backdating for testing, or simply erring under normal operation) writes `delivery_ack_ts: <now - 90000>` (25h in the past) into the notice file. On the next hourly review_promotions() tick, `now < notice['veto_deadline_ts']` is False immediately, so the variant is promoted to live (status flips, allocation set, live ledger event recorded, prose written) with zero elapsed real-world veto window -- the operator never had 24 hours (or any time at all) to react, directly violating the fail-closed design the module docstring describes."
+      ],
+      "suggested_fix": "Validate delivery_ack_ts on read: reject/ignore (treat as still-null) any value that is not a finite number, that is earlier than notice['created_ts'], or that is in the future relative to `now`; consider requiring the ack write to go through a host-validated control.py-style pipeline instead of direct agent edits to a file evolution.py trusts unconditionally."
+    },
+    {
+      "title": "Cascade: one variant's exception inside review_promotions() blackholes config persistence for every variant processed earlier in the same cycle, silently discarding a genuine operator acknowledgment on retry",
+      "severity": "P1",
+      "file": "engine/evolution.py",
+      "line": 496,
+      "confidence": 80,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "review_promotions() loops over every challenger variant, mutating an in-memory `raw` dict and writing side effects (notice files, ledger variant_events) as it goes, but persists the config change to disk with a SINGLE `self._write_raw_config(raw)` call only after the entire loop completes without raising. Any exception thrown while processing one variant (e.g. a malformed veto-notice JSON, a numeric issue in paired_comparison, a YAML I/O error) propagates out of review_promotions before that write happens -- discarding in-memory status transitions for every OTHER variant already advanced earlier in the same loop iteration, even though their notice files and ledger 'pending_promotion' events were already durably written as immediate side effects (not part of the same all-or-nothing unit as the config write). On the next hourly cycle, that variant's raw config status is still 'shadow' (the transition never landed), so _maybe_flag_pending fires again and unconditionally overwrites the notice file at the same path with a fresh notice (delivery_ack_ts reset to null), silently discarding any acknowledgment an operator/agent already recorded against the first notice -- while the ledger now carries two 'pending_promotion' events for the same transition, one of which the config never reflected.",
+      "evidence": [
+        "engine/evolution.py:490-501 review_promotions(): `changed |= self._maybe_flag_pending(...)` / `_advance_pending(...)` calls happen inside a plain for-loop over `raw['variants']` with no per-variant try/except; `if changed: self._write_raw_config(raw)` executes only after the loop finishes normally.",
+        "engine/evolution.py:513-545 _maybe_flag_pending(): writes the veto-notice file (line 533) and records the 'pending_promotion' ledger event (line 536) as immediate, already-committed side effects BEFORE the function returns and before the batched config write happens -- these are not rolled back if a later variant in the same loop raises.",
+        "engine/evolution.py:532-535: `(self._notices_dir / f\"{variant['id']}.json\").write_text(...)` is an unconditional overwrite with no check for an existing notice file, so a retry after a failed cycle blindly replaces any notice an operator/agent had already acknowledged, resetting delivery_ack_ts to null.",
+        "Constructed sequence: variant A (earlier in raw['variants']) reaches its funding checkpoint and is correctly flagged pending in cycle N (notice + ledger event written, but config write not yet reached); variant B (later in the list) throws while being advanced in the same cycle N (e.g. the malformed delivery_ack_ts scenario above, or any other exception) -> review_promotions raises -> A's config status transition is lost. An operator, seeing A's genuine notice file, acks it in the interim. Cycle N+1: A's raw status is still 'shadow', so _maybe_flag_pending re-fires for A, overwriting the notice (and the operator's ack) with a fresh one, and appending a second 'pending_promotion' ledger event."
+      ],
+      "suggested_fix": "Wrap each variant's processing in review_promotions() in its own try/except (ledgering an evolution_review_error risk event on failure, mirroring propose_and_spawn's per-proposal isolation), and make _maybe_flag_pending idempotent against an existing notice file (skip or merge rather than unconditionally overwrite) so a retried cycle cannot erase a prior acknowledgment."
+    },
+    {
+      "title": "Composition: config/rulesets.yaml is read-modify-written by evolution.py and control.py with no locking or optimistic-concurrency check, racing against the documented manual-edit promotion workflow",
+      "severity": "P1",
+      "file": "engine/evolution.py",
+      "line": 293,
+      "confidence": 75,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "docs and ops/traderctl document a human-in-the-loop promotion step ('Promotion flow: funding-gate pass -> pending_promotion -> human edits status to live', traderctl:180-181) that requires directly editing config/rulesets.yaml while the engine daemon may still be running. Both evolution.py's `_write_raw_config` (challenger spawning, promotion, veto, retirement) and control.py's `_write_raw_config`/`_process_allocations` perform a full-document read-yaml/write-yaml cycle on the same file with no file lock, mtime check, or hash-based compare-and-swap. Both engine-internal writers run automatically and frequently (control.py's allocation processing on every ~5-minute bucket rollover; evolution.py's review on every hour). If a human's editor save (or an agent's own direct edit, since agents have runtime read-write access) lands inside the window between one of these components' read and its write, the human's edit is silently overwritten with no error, warning, or conflict indication -- the engine simply persists its own (now-stale) in-memory copy of the document over the human's change.",
+      "evidence": [
+        "engine/evolution.py:293-302 `_write_raw_config`: `original = self.config_path.read_text(); self.config_path.write_text(yaml.safe_dump(raw, ...))` -- raw was captured by an earlier `_read_raw_config()` call, with no re-read/compare immediately before the write.",
+        "engine/control.py:193-203 and 205-250 `_process_allocations`/`_write_raw_config`: identical unlocked read-modify-write pattern on the same config_path, invoked on every bucket rollover via ControlProcessor.process().",
+        "ops/traderctl:180-181 explicitly documents the operator workflow as editing config/rulesets.yaml by hand to flip a variant's status to 'live' -- the exact kind of external write this code has no defense against.",
+        "Constructed race: operator opens config/rulesets.yaml in an editor to set variant X's status to 'live' per the documented promotion flow; between opening and saving, a bucket rollover fires control.py's allocation processor (or evolution.py spawns a challenger / advances a different variant), which reads the pre-edit file, computes its own change, and writes back -- landing after the operator's save and reverting variant X's status edit with no error surfaced to either party."
+      ],
+      "suggested_fix": "Add a simple advisory lock (e.g. an flock on a sidecar .lock file) around every read-modify-write cycle of config/rulesets.yaml, or a content-hash compare-and-swap that raises/retries if the file changed since it was last read, both for the engine's own writers and as guidance for any tooling that edits the file directly."
+    },
+    {
+      "title": "Assumption violation: safe_log_line's secret_key_name pattern hardcodes snake_case 'api_key' and would not catch the vendor's own demonstrated camelCase field naming ('orderID')",
+      "severity": "P1",
+      "file": "engine/executor.py",
+      "line": 52,
+      "confidence": 75,
+      "autofix_class": "gated_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "Invariant 6 rests entirely on safe_log_line refusing any line matching a credential-shaped pattern -- it is the last line of defense the module docstring describes, meant to catch credential-shaped content even from code that shouldn't be logging it in the first place. The secret_key_name pattern matches JSON keys containing the literal substrings 'secret', 'passphrase', 'private_key', 'api_key', or 'authorization' (case-insensitive on letters, but the underscore is a literal character the regex does not treat as optional). Elsewhere in this same file's sibling module (engine/live_client.py:430), the vendor client's real response is parsed with `resp.get('orderID') or resp.get('order_id') or resp.get('id')` -- direct evidence that this vendor's actual JSON payloads use camelCase field names (orderID), not exclusively the snake_case this codebase's own Python conventions use. Polymarket's CLOB API credential/auth objects are commonly shaped with a camelCase 'apiKey' field alongside 'secret'/'passphrase' (the latter two ARE caught since they contain the literal substrings regardless of case). A future log call that serializes a raw vendor auth/credential dict containing a key literally spelled 'apiKey' would sail through safe_log_line untouched, because 'apiKey' does not contain the substring 'api_key' (no underscore) -- defeating the one safety net this invariant relies on for exactly the vendor shape this codebase's own comments admit is unverified ('CAUTION -- vendor-API guesswork zone', live_client.py:398).",
+      "evidence": [
+        "engine/executor.py:52-55: `secret_key_name` pattern is `r'\"[^\"]*(?:secret|passphrase|private_key|api_key|authorization)[^\"]*\"\\s*:'` -- 'api_key' is a literal substring requiring an underscore; it will not match a JSON key spelled 'apiKey'.",
+        "engine/live_client.py:430 `_ClobV2Adapter.post_order`: `order_id = resp.get('orderID') or resp.get('order_id') or resp.get('id')` -- demonstrates the vendor response actually uses camelCase ('orderID') as one of its possible shapes, establishing that this is not a purely hypothetical naming convention for this vendor's API surface.",
+        "Constructed scenario: a future debugging/log statement (e.g. inside build_venue_client or an error handler around derive_l2) serializes the raw `api_creds` object or a raw HTTP response dict from create_or_derive_api_key() that contains `{'apiKey': '<opaque short token>', 'secret': '...', 'passphrase': '...'}` via safe_log_line -- 'secret' and 'passphrase' keys are caught and the whole line is refused, UNLESS the offending value happens to be the apiKey alone in a record that omits secret/passphrase (e.g. a log line that only echoes back the derived apiKey for debugging), which would pass through uncaught."
+      ],
+      "suggested_fix": "Broaden the secret_key_name pattern to match camelCase equivalents too, e.g. `(?:secret|passphrase|private[_-]?key|api[_-]?key|authorization)` (making the separator optional/either form), and add a short allowlist-based test asserting common vendor camelCase credential field names are refused."
+    },
+    {
+      "title": "Composition: the consecutive-failure halt counter conflates unrelated failure domains (feed/executor vs. reporting/evolution/control housekeeping) and is never reset by 'no_market' ticks, letting a reporting bug misleadingly halt live trading",
+      "severity": "P2",
+      "file": "engine/main.py",
+      "line": 117,
+      "confidence": 75,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "why_it_matters": "RiskManager.record_failure/record_success is a single shared counter that both run_once (the ~3s trading tick: feed/executor exceptions) and _on_bucket_rollover (the ~5min housekeeping tick: report generation, control-file processing, evolution) feed into via the identical `except Exception` -> record_failure path. Critically, run_once's 'no_market' branch (snap is None) calls NEITHER record_success NOR record_failure, leaving whatever count is already accumulated untouched. This means a housekeeping-only bug (e.g. a report-generation edge case, or the review_promotions exception scenario documented separately in this review) that fires once per bucket rollover can accumulate toward consecutive_failure_halt without ever being reset by intervening successful market ticks, PROVIDED those ticks happen to return 'no_market' rather than 'ok' -- a realistic condition during legitimate feed gaps. Once the threshold is crossed, RiskManager.halted() returns 'failure_halt', which is checked first in RiskManager.check() and blocks every entry across every variant -- a full trading halt triggered by a bug that has nothing to do with market-data or order-execution reliability, misreported to the operator via record_failure's hardcoded log message ('N consecutive API failures') as if it were a feed/exchange problem.",
+      "evidence": [
+        "engine/main.py:109-130 run_once(): the `if snap is None: return 'no_market'` branch (implicit, inside the try block before the for-loop) returns without calling self.risk.record_success() or record_failure() -- confirmed by reading the full function: only the exception path (line 126) and the post-loop success path (line 129) touch the counter.",
+        "engine/main.py:202-239 `_on_bucket_rollover`: its own `except Exception as exc: self.risk.record_failure(now)` (line 235) feeds the SAME counter instance (`self.risk`) as run_once, with no separate domain/category.",
+        "engine/risk.py:110-119 `record_failure`: increments `self._consecutive_failures` unconditionally regardless of caller, and once `>= threshold` records a ledger event whose detail string is hardcoded as 'N consecutive API failures (halt at threshold)' -- misattributing housekeeping failures as API failures.",
+        "Constructed sequence: a persistent bug in generate_report (called every single bucket rollover) or review_promotions (called hourly) begins throwing; each occurrence adds 1 to the shared counter. If the market feed is simultaneously producing intermittent 'no_market' snapshots (legitimate quiet periods, feed hiccups that return None rather than raising), those ticks neither add to nor reset the counter, so the housekeeping failures alone can accumulate across several bucket rollovers until consecutive_failure_halt is reached, halting all live entries while the log implies an unrelated cause."
+      ],
+      "suggested_fix": "Track feed/executor failures and housekeeping failures as separate counters (or at minimum separate halt reasons), and make 'no_market' either reset or explicitly not contribute either way as documented behavior; fix the record_failure log message to reflect the actual failure source."
+    }
+  ],
+  "residual_risks": [
+    "engine/live_client.py's LiveExecutor is not yet wired into engine/main.py's loop (main.py hard-refuses to start with any 'live' status variant, and reconcile_on_startup/poll_fills/cancel_stale are called from nowhere in production code) -- every live_client.py finding in this review is currently unreachable in production but will become immediately live the moment U11 wiring lands; a dedicated adversarial re-review of that wiring (including whichever process now calls reconcile_on_startup at the correct point relative to order submission) is warranted before any real capital moves.",
+    "The trust boundary around runtime/control/veto-notices/ and runtime/control/vetoes/ is asymmetric with the rest of the control-plane: control.py's approved-lessons/pending-strategy-appends/allocation-requests directories all have a validate-or-reject-and-archive pipeline with ledgered rejection reasons, but evolution.py reads veto-notices/ and vetoes/ directly with no equivalent validation, archival, or rejection path for malformed agent-written content.",
+    "config/rulesets.yaml has no locking primitive anywhere in the codebase despite being a documented multi-writer resource (engine's own evolution.py and control.py, plus a documented human/agent manual-edit workflow for promotion)."
+  ],
+  "testing_gaps": [
+    "No test simulates VenueClient.post_order raising after the exchange has actually accepted the order (an ambiguous/ack-lost submission), which is the scenario that produces a silent untracked live position despite the write-ahead ledger pattern.",
+    "No test exercises cancel_stale or reconcile_on_startup's stale-cancel branch racing against a fill landing between the cancel_order() call and the ledger write.",
+    "No test exercises two concurrent writers to config/rulesets.yaml (e.g. a manual edit landing between an evolution.py or control.py read and write).",
+    "No test validates delivery_ack_ts plausibility bounds in veto notices (backdated, zero, non-numeric, or future-dated ack timestamps all pass silently through _advance_pending today).",
+    "No test constructs an exception thrown mid-loop inside review_promotions() to verify whether an earlier variant's already-durable side effects (notice file, ledger event) survive a later variant's failure, or whether a retried cycle can silently overwrite an existing (possibly-acknowledged) notice file.",
+    "test_no_other_module_constructs_approved (tests/test_risk.py) only verifies a literal substring is absent; it does not test that an aliased import or dynamic construction of Approved is actually detected/rejected."
+  ]
+}

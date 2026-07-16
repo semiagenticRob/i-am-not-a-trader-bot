@@ -1,0 +1,94 @@
+{
+  "reviewer": "reliability",
+  "findings": [
+    {
+      "title": "reconcile_on_startup marks a fully-filled (or exchange-cancelled) live order as 'failed', silently losing the position",
+      "severity": "P0",
+      "file": "engine/live_client.py",
+      "line": 315,
+      "confidence": 75,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "The write-ahead ledger pattern exists specifically so a crash between placing an order and recording its outcome can be detected and repaired. reconcile_on_startup detects an orphan by checking whether a ledger 'open' row has a matching entry in client.get_open_orders(). But get_open_orders() (per the VenueClient contract and the _ClobV2Adapter implementation calling the vendor's get_orders()) only returns resting/unmatched orders -- an order that already filled, or that the exchange cancelled, is gone from that list just like an order that was never submitted. reconcile_on_startup cannot tell these apart: both hit the `match is None` branch and are unconditionally written as status='failed', filled_price=None, fee_usd=0.0 (line 316) plus a 'reconcile_orphan_ledger' risk event. If the crash happened to land after post_order() succeeded and the GTC limit order filled before the process came back up, the system now believes it holds no position and spent no money, when in reality a real order was filled with real capital at risk, riding to market resolution completely untracked -- the exact 'untracked live order' scenario the write-ahead design was built to prevent. The docstring's claim that this branch covers 'the write-ahead row whose submission never happened, or an order that vanished' conflates 'never submitted' with 'already filled/cancelled,' which are opposite outcomes for the trader's capital and P&L.",
+      "evidence": [
+        "engine/live_client.py:284-297 reconcile_on_startup docstring claims exactly 4 cases, but the two enumerated 'no exchange order' subcases ('submission never happened' vs 'an order that vanished') are conflated into a single 'failed' outcome",
+        "engine/live_client.py:298 `exchange = list(self._client.get_open_orders())` -- only resting orders, never filled/cancelled ones",
+        "engine/live_client.py:131-139 VenueClient.get_open_orders() docstring: normalized shape has no notion of a filled/cancelled historical order",
+        "engine/live_client.py:315-323 `if match is None:` unconditionally marks the trade 'failed' with filled_price=None, fee_usd=0.0 -- no fallback lookup (e.g. querying trade/fill history, or get_order by a persisted order_id) to distinguish a real fill from a never-placed order",
+        "engine/ledger.py:65-79 the `trades` schema has no order_id column at all, so even if reconciliation wanted to look up the specific order's fate post-crash, it has no persisted handle to do so -- only the fuzzy (token_id, price) match available from in-memory state that was lost in the crash"
+      ],
+      "suggested_fix": "Before declaring a ledger-orphan row 'failed', reconciliation must positively confirm the order was never accepted (e.g. persist the exchange order_id in the ledger at submission time -- even in a best-effort second write right after post_order() succeeds -- and look it up via get_order() on restart) rather than inferring 'not in get_open_orders()' as 'never happened.' At minimum, query the exchange's trade/fill history for the token_id around the trade's timestamp before writing status='failed', and only use 'failed' when there is positive evidence no order was ever placed."
+    },
+    {
+      "title": "No startup reconciliation for shadow trades stuck 'open' after a crash between the two ledger writes; silently corrupts the evidence-generation pipeline",
+      "severity": "P1",
+      "file": "engine/executor.py",
+      "line": 107,
+      "confidence": 75,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "ShadowExecutor.execute() performs the same two-step write pattern as the live path (open row, then a second write recording the modeled fill), but only the live path (engine/live_client.py) has a reconcile_on_startup routine; nothing in engine/main.py's build_loop or startup() ever inspects the ledger for shadow trades stuck in status='open' after a crash (kill -9, host power loss, an OOM kill, etc. landing between the two calls at executor.py:107 and :118). This system's entire purpose is generating shadow-trading evidence for the funding/promotion gate (evolution.py) -- a stuck-open row is silently excluded from realized_pnl_rows() (ledger.py's PnL join filters status='filled') forever, understating the evidence sample size for that variant with no risk_event, no log line, and no operator-visible signal that data was lost. has_entry() still returns True for the bucket so no duplicate trade is placed (that half of the invariant holds), but the missing repair means every crash silently and permanently drops one evaluation from the gate's statistics.",
+      "evidence": [
+        "engine/executor.py:104-118 'Two ledger writes on purpose' -- record_trade (open) then update_trade_fill (filled), with no wrapping transaction and no repair mechanism referenced",
+        "engine/main.py:311-344 build_loop() wires ShadowExecutor(ledger) with no call to any reconciliation/repair step for open shadow trades on startup",
+        "engine/main.py:271-308 startup() covers config validation and the live-mode gate only; no ledger-state repair of any kind",
+        "engine/ledger.py:356-358 realized_pnl_rows()/live_realized_pnl_on_day() only consider status='filled', so a stuck-open row is invisible to all downstream PnL and gate-evaluation logic with no error surfaced"
+      ],
+      "suggested_fix": "Add a startup routine (mirroring reconcile_on_startup's intent but for shadow trades) that finds trades with status='open' and mode='shadow' left over from a prior run and either completes the modeled fill (deterministic given the recorded intended_price) or marks them explicitly (e.g. a new terminal status or a risk_event) so the evidence count and any operator-facing report reflect the loss rather than silently omitting it."
+    },
+    {
+      "title": "Top-level log() calls in EngineLoop.run_forever() are outside the per-tick exception guard; a logging failure there crash-loops via launchd KeepAlive instead of reaching a STOP-style halt",
+      "severity": "P2",
+      "file": "engine/main.py",
+      "line": 242,
+      "confidence": 75,
+      "autofix_class": "gated_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "Every log call inside run_once() and _on_bucket_rollover() is protected by their own try/except Exception blocks (main.py:119-130, :205-239), which is the deliberate design: a feed/executor/logging fault increments the failure counter and the loop survives. But the 'engine_start' log at the top of run_forever() (line 242-249) and the 'status_change' log inside the while loop (line 258-260) sit outside any try/except. safe_log_line (engine/executor.py:59-69) is contractually allowed to raise ValueError on any record that matches a SECRET_PATTERN, and engine_start's payload includes `[v.id for v in self.config.active_variants]` -- config-controlled strings that are never validated against the secret patterns. If a variant id (or, for status_change, any future field added to that payload) ever produces a match, the resulting ValueError propagates all the way out of main(), the process exits, and launchd's KeepAlive (ops/com.iamnotatrader.engine.plist:31-32, unconditional `<true/>`) restarts it -- hitting the identical unguarded log call with the identical static config on every restart, forever. This is exactly the crash-loop failure mode the reviewer brief calls out as distinct from a genuine STOP-file halt: the engine never reaches 'parked,' never writes a risk_event, and never stops restarting on its own.",
+      "evidence": [
+        "engine/main.py:241-249 `run_forever` calls `self.log({'event': 'engine_start', ..., 'variants': [...]})` before entering the while loop, with no try/except around it",
+        "engine/main.py:257-260 the `status_change` log call inside the while loop is also outside `run_once`'s try/except (it executes after `run_once` returns)",
+        "engine/executor.py:59-69 `safe_log_line` raises ValueError by contract when a record matches SECRET_PATTERNS, and this is the sole log_sink used by `_print_log`/all EngineLoop logging",
+        "ops/com.iamnotatrader.engine.plist:31-32 `<key>KeepAlive</key><true/>` restarts the process unconditionally on any exit, with no backoff/limit configured"
+      ],
+      "suggested_fix": "Wrap both the 'engine_start' and 'status_change' log calls in run_forever() with the same try/except pattern used elsewhere (log failures should never be fatal to the loop), or make log_sink failures non-fatal globally by catching exceptions at the _print_log boundary and falling back to a minimal safe record."
+    },
+    {
+      "title": "LiveExecutor's vendor CLOB client is constructed with no explicit request timeout",
+      "severity": "P1",
+      "file": "engine/live_client.py",
+      "line": 388,
+      "confidence": 75,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "why_it_matters": "post_order(), get_order(), get_open_orders(), and cancel_order() all run synchronously on the single-threaded engine loop's thread once LiveExecutor is wired in for U11 go-live. derive_l2() and build_venue_client() construct the vendor ClobClient with only `host`, `key`, `chain_id`, and `creds` -- no timeout parameter is passed anywhere, unlike every other HTTP client in this codebase (GammaClient, OrderBookClient, and SpotFeed all explicitly set `httpx.Client(timeout=5.0)` in engine/market_feed.py). If the vendor client has no sane internal default and Polymarket's CLOB is slow or half-open during an order submission or poll, the call blocks indefinitely: the engine loop wedges (not crashes), so launchd's KeepAlive never restarts it and the STOP-file check at the top of the next run_once() never gets a chance to run, leaving open GTC orders unmanaged during exactly the failure condition (a struggling exchange) most likely to need fast cancellation.",
+      "evidence": [
+        "engine/live_client.py:388-392 `derive_l2` constructs the L1 and L2 clients via `client_factory(host=..., key=..., chain_id=..., creds=...)` with no timeout argument",
+        "engine/live_client.py:466-480 `build_venue_client` similarly passes no timeout to `ClobClient`",
+        "engine/market_feed.py:167,275,337 every other network client in this codebase (`GammaClient`, `OrderBookClient`, `SpotFeed`) explicitly sets `httpx.Client(timeout=5.0)`, showing the project's own established convention for exactly this class of dependency",
+        "engine/live_client.py:395-405 module comment flags the vendor adapter as an unverified 'CAUTION -- vendor-API guesswork zone' pending a live smoke test, confirming this path has not yet been exercised against the real venue's latency characteristics"
+      ],
+      "suggested_fix": "Confirm whether py_clob_client_v2's ClobClient accepts a timeout/session parameter (or wraps an httpx/requests session that does) and set an explicit bounded timeout matching the rest of the codebase's convention before this path is enabled for real trading; verify in the Phase 2 smoke test referenced in the module docstring."
+    }
+  ],
+  "residual_risks": [
+    "RiskManager's consecutive-failure halt is self-clearing: record_success() resets both `_consecutive_failures` and `_failure_event_recorded` on any single clean tick (engine/risk.py:121-123), so a flapping dependency (e.g. Gamma intermittently erroring) can cycle halt-log/auto-clear/halt-log indefinitely without ever escalating to an operator-visible persistent stop; only the STOP file provides a sticky halt that survives a good tick.",
+    "Bucket-rollover housekeeping (ResolutionPoller.poll, evolution.propose_and_spawn, control_processor.process -- engine/main.py:202-239) runs unconditionally on every bucket rollover regardless of STOP file state; only new trade entries are parked. An operator relying on STOP to freeze the system entirely may still see new challenger variants spawned or control-file promotions applied while STOP is active.",
+    "reconcile_on_startup's match key is (token_id, price within 0.001) with no persisted order_id in the ledger to disambiguate; if two live variants ever hold simultaneous open orders on the same market/side at nearly the same price, reconciliation could attribute the wrong exchange order to the wrong ledger row.",
+    "LiveExecutor.execute()'s except-block ledger write (`update_trade_fill(trade_id, None, 0.0, 'failed')` at live_client.py:225 after a post_order failure) can itself raise (e.g. sqlite contention); if it does, the original OrderSubmissionError's exception chain is not explicitly preserved for that inner failure and the write-ahead row is left permanently 'open' -- capital-conservative (reduces future allocation via `_remaining_allocation`) rather than unsafe, but undiagnosed without log correlation."
+  ],
+  "testing_gaps": [
+    "No test exercises reconcile_on_startup against an exchange order that has already been filled or cancelled before the crash was detected (i.e. absent from get_open_orders() despite having actually executed) -- only 'still open on the exchange' and 'never existed' cases appear to be covered, leaving the P0 misclassification path in this review untested.",
+    "No test or replay scenario simulates a process crash (or forced kill) landing between ShadowExecutor.record_trade and update_trade_fill, and correspondingly there is no startup repair routine to test for the shadow path at all.",
+    "No test exercises safe_log_line raising inside EngineLoop.run_forever's unguarded top-level log calls (engine_start / status_change) to confirm the resulting crash-loop behavior under launchd KeepAlive.",
+    "No test covers LiveExecutor / _ClobV2Adapter against slow or hanging responses from the vendor client -- the module explicitly documents its vendor call shapes as unverified 'GUESS' pending a live smoke test, so timeout/latency behavior is entirely unexercised."
+  ]
+}
