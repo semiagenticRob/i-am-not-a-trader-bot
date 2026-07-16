@@ -4,9 +4,10 @@ Every evaluation, trade, fill, resolution, risk event, and variant status
 change lands here, attributable per variant. Discipline is enforced at two
 layers:
 
-- API surface: the only mutation is ``update_trade_fill`` (open -> terminal).
-  There are no general UPDATE/DELETE methods; status history for variants is
-  append-only rows, never edits.
+- API surface: the only mutations are ``update_trade_fill`` (open ->
+  terminal) and ``attach_order_id`` (a narrow, open-only field set, applied
+  once right after order submission). There are no general UPDATE/DELETE
+  methods; status history for variants is append-only rows, never edits.
 - Storage: CHECK constraints pin enum columns, and
   ``UNIQUE(bucket_ts, variant_id, mode)`` on trades is the storage-layer
   backstop for the one-entry-per-bucket invariant.
@@ -75,6 +76,7 @@ CREATE TABLE IF NOT EXISTS trades (
     stake_usd REAL NOT NULL,
     fee_usd REAL NOT NULL DEFAULT 0.0,
     status TEXT NOT NULL CHECK (status IN {TRADE_STATUSES!r}),
+    order_id TEXT,
     UNIQUE (bucket_ts, variant_id, mode)
 );
 CREATE TABLE IF NOT EXISTS resolutions (
@@ -132,6 +134,7 @@ class Trade:
     stake_usd: float
     fee_usd: float
     status: str
+    order_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -267,6 +270,28 @@ class Ledger:
             raise LedgerError(f"no trade with id {trade_id}")
         raise LedgerError(
             f"trade {trade_id} is terminal ('{row['status']}'); terminal rows are immutable"
+        )
+
+    def attach_order_id(self, trade_id: int, order_id: str) -> None:
+        """Best-effort second write, right after the exchange accepts an order:
+        record its id on the still-open live trade row.
+
+        This lets a later crash-reconciliation query the order directly
+        (``get_order``) instead of fuzzy-matching by token/price, which
+        cannot tell a filled order (already gone from ``get_open_orders``)
+        apart from one that was never placed at all.
+        """
+        cur = self._conn.execute(
+            "UPDATE trades SET order_id = ? WHERE id = ? AND status = 'open'",
+            (order_id, trade_id),
+        )
+        if cur.rowcount == 1:
+            return
+        row = self._conn.execute("SELECT status FROM trades WHERE id = ?", (trade_id,)).fetchone()
+        if row is None:
+            raise LedgerError(f"no trade with id {trade_id}")
+        raise LedgerError(
+            f"trade {trade_id} is terminal ('{row['status']}'); cannot attach order_id"
         )
 
     def record_resolution(

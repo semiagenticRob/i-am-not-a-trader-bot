@@ -110,6 +110,29 @@ def test_open_trades_filters_by_variant_and_mode(ledger):
     assert only[0].mode == "live"
 
 
+def test_attach_order_id_round_trips_through_open_trades(ledger):
+    trade_id = ledger.record_trade(
+        ts=float(BUCKET),
+        bucket_ts=BUCKET,
+        variant_id="mom-a",
+        market_slug=SLUG,
+        side="up",
+        mode="live",
+        intended_price=0.70,
+        stake_usd=5.0,
+        status="open",
+    )
+    assert ledger.open_trades()[0].order_id is None
+    ledger.attach_order_id(trade_id, "ord-123")
+    assert ledger.open_trades()[0].order_id == "ord-123"
+
+
+def test_attach_order_id_refuses_on_terminal_trade(ledger):
+    trade_id = enter_and_fill(ledger)  # already 'filled'
+    with pytest.raises(LedgerError):
+        ledger.attach_order_id(trade_id, "ord-999")
+
+
 def test_duplicate_bucket_variant_mode_raises(ledger):
     enter_and_fill(ledger)
     with pytest.raises(sqlite3.IntegrityError):
