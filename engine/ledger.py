@@ -46,6 +46,10 @@ VARIANT_EVENTS = (
     "vetoed",
     "retired",
     "killed",
+    # Evolution (U9): a candidate split whose CI did not exclude zero (or was
+    # otherwise ineligible) — logged so "why was no challenger spawned" is
+    # answerable from the ledger alone.
+    "proposal_rejected",
 )
 
 _SCHEMA = f"""

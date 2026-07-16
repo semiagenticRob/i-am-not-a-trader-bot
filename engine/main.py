@@ -46,6 +46,7 @@ from pathlib import Path
 from analytics.report import generate_report
 from engine import rulesets
 from engine.config import Config, ConfigError, check_frozen_variants, load_config
+from engine.evolution import EvolutionManager
 from engine.executor import ResolutionPoller, ShadowExecutor, safe_log_line
 from engine.ledger import Ledger
 from engine.market_feed import (
@@ -61,6 +62,7 @@ from engine.signals import BUCKET_SEC, FeatureSnapshot
 
 POLL_SEC = 3.0
 CONFIG_SNAPSHOT_NAME = "config-snapshot.yaml"
+EVOLUTION_HOOK_SEC = 3600.0  # evolution runs at most once per hour, not per bucket
 
 
 def _print_log(record: dict) -> None:
@@ -82,6 +84,7 @@ class EngineLoop:
         sleeper: Callable[[float], None] = time.sleep,
         runtime_dir: Path | str | None = None,
         log_sink: Callable[[dict], None] = _print_log,
+        evolution=None,  # engine.evolution.EvolutionManager | None; None -> skipped
     ):
         self.config = config
         self.ledger = ledger
@@ -93,8 +96,10 @@ class EngineLoop:
         self.sleeper = sleeper
         self.runtime_dir = Path(runtime_dir) if runtime_dir is not None else None
         self.log = log_sink
+        self.evolution = evolution
         self._last_bucket: int | None = None
         self._last_status: str | None = None
+        self._last_evolution_ts: float | None = None
 
     # -- one tick -----------------------------------------------------------
 
@@ -211,6 +216,13 @@ class EngineLoop:
                     {"event": "report_generated", "ts": now,
                      "ledger_rows": report["ledger_rows"]}
                 )
+            if self.evolution is not None and (
+                self._last_evolution_ts is None
+                or now - self._last_evolution_ts >= EVOLUTION_HOOK_SEC
+            ):
+                self._last_evolution_ts = now
+                self.evolution.propose_and_spawn(now)
+                self.evolution.review_promotions(now)
         except Exception as exc:  # housekeeping must never kill the loop
             self.risk.record_failure(now)
             self.log(
@@ -288,7 +300,7 @@ def startup(config_path: Path, runtime_dir: Path) -> Config:
     return config
 
 
-def build_loop(config: Config, runtime_dir: Path) -> EngineLoop:
+def build_loop(config: Config, runtime_dir: Path, config_path: Path | None = None) -> EngineLoop:
     """Wire real clients: Gamma/CLOB/Binance feeds, ledger, risk, shadow executor."""
     logs_dir = runtime_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -298,6 +310,9 @@ def build_loop(config: Config, runtime_dir: Path) -> EngineLoop:
     spot = SpotFeed(capture=capture)
     ledger = Ledger(runtime_dir / "ledger.db")
     staleness = config.risk.max_quote_staleness_sec
+    evolution = (
+        EvolutionManager(config_path, ledger, runtime_dir) if config_path is not None else None
+    )
     return EngineLoop(
         config=config,
         ledger=ledger,
@@ -306,6 +321,7 @@ def build_loop(config: Config, runtime_dir: Path) -> EngineLoop:
         risk_manager=RiskManager(config, ledger, runtime_dir),
         resolution_poller=ResolutionPoller(ledger, gamma),
         runtime_dir=runtime_dir,
+        evolution=evolution,
     )
 
 
@@ -321,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime_dir.mkdir(parents=True, exist_ok=True)
 
     config = startup(config_path, runtime_dir)
-    loop = build_loop(config, runtime_dir)
+    loop = build_loop(config, runtime_dir, config_path)
 
     if config.strategy_md_drift:
         now = loop.clock()
